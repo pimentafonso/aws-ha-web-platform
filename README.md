@@ -13,6 +13,7 @@ A highly available web platform on AWS, defined entirely in CloudFormation, runn
 - [Observability](#observability)
 - [Reliability testing](#reliability-testing)
 - [Cost](#cost)
+- [Run locally](#run-locally)
 - [Repository layout](#repository-layout)
 - [Deploy and teardown](#deploy-and-teardown)
 - [CI/CD](#cicd)
@@ -27,7 +28,23 @@ I wanted a production-shaped reference platform for a stateless backend API, one
 - is reproducible from code, deployable from CI without long-lived AWS credentials, and can be torn down completely in one command;
 - tells me when something is wrong before a user does.
 
-The API itself is deliberately small (_TBD: endpoints_), so the focus stays on the infrastructure around it.
+The API itself is deliberately small, so the focus stays on the infrastructure around it. It is a notes service in Node.js 22 and Express 5, backed by PostgreSQL with a Redis cache-aside layer:
+
+| Method and path | Purpose |
+|---|---|
+| `GET /health` | Liveness for the ALB. Does not touch dependencies, so a database failover does not make the ALB drain every task. |
+| `GET /ready` | Readiness: checks PostgreSQL (required) and Redis (optional). Returns 503 if the database is unreachable. |
+| `POST /api/notes` | Create a note (`title`, optional `content`). |
+| `GET /api/notes` | List recent notes (`?limit=`, max 100). |
+| `GET /api/notes/:id` | Read a note through the cache. The `X-Cache: HIT|MISS` header shows which path served it. |
+| `DELETE /api/notes/:id` | Delete a note and invalidate its cache entry. |
+
+Behaviours that matter for the platform:
+
+- **Redis is optional.** If ElastiCache is unavailable, requests fall through to PostgreSQL and a warning is logged. An integration test covers this.
+- **Graceful shutdown.** On SIGTERM (sent by ECS when a task stops), the server stops accepting connections, finishes in-flight requests, and closes its pools.
+- **Safe concurrent start-up.** Schema migrations run at start-up under a PostgreSQL advisory lock, so several tasks starting at once do not race.
+- **Structured logs.** One JSON line per request on stdout, keyed by the ALB trace id when present.
 
 ## Architecture
 
@@ -97,6 +114,16 @@ infra/parameters/       Parameter files per environment (dev, prod)
 scripts/                deploy, destroy and lint scripts used by make and CI
 docs/                   Diagrams, screenshots, runbooks
 .github/workflows/      CI/CD pipelines
+```
+
+## Run locally
+
+Needs Docker and Node.js 22. PostgreSQL and Redis run in containers on ports 5442 and 6389, so they do not clash with local installs.
+
+```sh
+docker compose up -d --wait               # PostgreSQL and Redis
+cd app && npm ci && npm test              # lint separately with: npm run lint
+docker compose --profile app up --build   # API on http://localhost:3000
 ```
 
 ## Deploy and teardown

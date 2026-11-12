@@ -1,0 +1,31 @@
+{
+  "name": "ha-notes-api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Small Express API used to exercise the aws-ha-web-platform infrastructure",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "lint": "eslint .",
+    "test": "node --test --test-concurrency=1"
+  },
+  "dependencies": {
+    "express": "5.3.0",
+    "pg": "8.23.1",
+    "pino": "10.4.0",
+    "pino-http": "11.0.0",
+    "redis": "6.3.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint": "10.14.0",
+    "globals": "17.14.0",
+    "supertest": "7.3.2"
+  }
+}

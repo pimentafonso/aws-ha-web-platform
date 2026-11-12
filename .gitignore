@@ -1,0 +1,31 @@
+# Node
+node_modules/
+npm-debug.log*
+coverage/
+
+# Environment and secrets (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.aws/
+credentials
+
+# Local parameter overrides with account-specific values
+infra/parameters/**/*.local.json
+
+# Build and tool output
+dist/
+.cfn-lint-cache/
+packaged-*.yaml
+.checkov/
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Assistant tooling
+.claude/

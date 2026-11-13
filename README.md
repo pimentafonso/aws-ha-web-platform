@@ -52,7 +52,7 @@ Behaviours that matter for the platform:
 
 ![Current architecture: the Notes API, PostgreSQL and Redis running locally in docker compose](docs/images/architecture-current.svg)
 
-Nothing is deployed to AWS yet. PostgreSQL and Redis stand in locally for RDS and ElastiCache. The network, data, registry, compute, dns and edge stacks (in [`infra/templates/`](infra/templates/)) are written and pass lint, but have not been deployed. This diagram is updated as each stack lands.
+Nothing is deployed to AWS yet. PostgreSQL and Redis stand in locally for RDS and ElastiCache. All the stacks in [`infra/templates/`](infra/templates/) are written and pass lint, but none has been deployed. This diagram is updated as each stack lands.
 
 ### Target
 
@@ -86,8 +86,9 @@ flowchart LR
 | dns | `infra/templates/dns.yaml` | Route 53 hosted zone for the platform subdomain (prod) |
 | edge-global | `infra/templates/edge-global.yaml` | us-east-1: CloudFront viewer certificate, WAF web ACL (prod) |
 | edge | `infra/templates/edge.yaml` | CloudFront distribution, private S3 static bucket, Route 53 records |
-| security | `infra/templates/security.yaml` | CloudTrail, GuardDuty |
-| observability | `infra/templates/observability.yaml` | CloudWatch dashboard, alarms, SNS topic |
+| logging | `infra/templates/logging.yaml` | Access-log bucket for the ALB, CloudFront and S3 |
+| security | `infra/templates/security.yaml` | Once per account: CloudTrail, GuardDuty, finding alerts |
+| observability | `infra/templates/observability.yaml` | CloudWatch alarms, alarm topic, dashboard |
 
 ## Design decisions and trade-offs
 
@@ -141,7 +142,7 @@ At list prices, the compute stack adds about **$33.31 a month in dev** (about $0
 - **Migrations run as their own task.** The same image with a different command (`node src/migrate.js`) runs as a one-off ECS task. It uses the master secret to apply migrations and keep `notes_app` and its grants current. The deploy order is: push the image, run the migration task, then update the service. On the very first deploy the service is created with no tasks (`ServiceEnabled=false`), so that the migration task can create `notes_app` before any task tries to log in as it. Locally, the server still applies migrations at start-up (`MIGRATE_ON_START`).
 - **Two execution roles.** The service's execution role can pull the image, write to its log group and read the Valkey token. The migration task's role can read the master secret instead. Both can decrypt with the data key only through Secrets Manager (`kms:ViaService`). The long-running service therefore never holds the master password, even indirectly.
 - **ECR in its own stack.** The repository is deployed before compute, so an image can be pushed before the service exists, and images survive a compute teardown. Tags are immutable, so a task definition that names a tag (the commit SHA) always runs exactly what was tested. Images are scanned on push. Untagged images expire after a day, and only the last 10 tagged images are kept, at $0.10 per GB-month. The image is about 64 MB.
-- **Things I left off for now.** ALB access logs need an S3 bucket with a delivery policy; that comes with the security and observability stack. Container Insights stays off until I have measured what it costs, since it is billed per metric or per observation. The free ECS service CPU and memory metrics already drive auto scaling. Fargate Spot is not in the AWS Price List, because its price varies, so I have not priced it.
+- **Things I left off for now.** Container Insights stays off until I have measured what it costs, since it is billed per metric or per observation. The free ECS service CPU and memory metrics already drive auto scaling. Fargate Spot is not in the AWS Price List, because its price varies, so I have not priced it.
 
 ### Edge (`infra/templates/dns.yaml`, `edge-global.yaml`, `edge.yaml`)
 
@@ -157,8 +158,27 @@ At list prices, the edge adds about **$0 a month in dev** and **$9.50 in prod** 
   3. The common rule set (OWASP-style protections such as XSS and path traversal). Its 8 KB body limit is set to count, not block, because a valid note can be larger; the API rejects bodies over 32 KB itself.
   4. Known bad inputs, which covers exploit patterns such as Log4j.
 
-  WAF costs $5 per web ACL plus $1 per rule or rule group each month, plus $0.60 per million requests. These four came to $9 a month, against $7 for the common rule set and rate limit alone. Full WAF request logging arrives with the security and observability stack; sampled requests and metrics are on now.
+  WAF costs $5 per web ACL plus $1 per rule or rule group each month, plus $0.60 per million requests. These four came to $9 a month, against $7 for the common rule set and rate limit alone. Blocked and counted requests are logged (see below); sampled requests and metrics are on too.
 - **Private static bucket.** Block Public Access is on, ACLs are disabled, there is no website hosting, and HTTPS is required. The bucket policy lets only this distribution read objects (origin access control: CloudFront signs every request with SigV4). Versioning lets me roll back a bad upload, and old versions expire after 30 days. Objects use SSE-S3 rather than a customer-managed KMS key: the files are public web content served to anyone through CloudFront, so a $1-a-month key and a CloudFront key policy would protect nothing. The bucket holds one small page ([`static/index.html`](static/index.html)) describing the API, so the S3 path is real and testable.
+
+### Security and observability (`logging.yaml`, `security.yaml`, `observability.yaml`, WAF logs in `edge-global.yaml`)
+
+At list prices, this adds about **$4.10 a month in dev** and **$5.30 in prod**, plus **about $1 a month once for the account** and GuardDuty's usage charges. With everything else, that makes about $71.80 a month in dev and $289.45 in prod. The account-level stack is billed once, whichever environments are up.
+
+- **CloudTrail and GuardDuty are per account, not per environment.** Dev and prod share one AWS account. A second trail would bill a second copy of every management event ($0.00002 each), and GuardDuty allows one detector per Region anyway. So `security.yaml` is deployed once, and covers both environments.
+- **CloudTrail.** One trail records management events in every Region, including us-east-1, where the edge pieces live. It includes global services such as IAM, STS and CloudFront. The first copy of management events is free. Log file validation writes signed digest files, so I can prove a log was not changed or deleted. The logs go to an audit bucket encrypted with a customer-managed key ($1 a month), which only CloudTrail and GuardDuty may use, each for its own resources. The bucket is versioned, keeps logs for 365 days, and is retained if the stack is deleted, along with its key. Data events (individual S3 and Lambda calls) are not recorded; they cost $0.10 per 100,000 and nothing here needs them.
+- **GuardDuty.** The detector analyses CloudTrail management events ($4.40 per million), VPC flow logs and DNS logs ($1.10 per GB) for this account. GuardDuty offers a 30-day free trial, and I will measure the real charge during the deploy sessions. Its optional plans are listed explicitly as disabled, so no account default can switch one on and bill it silently: S3 data events, RDS login events, EBS malware scanning, EKS and Lambda. Runtime Monitoring for Fargate is a parameter, off for now. It costs $1.50 per vCPU-month and adds an agent sidecar to every task, and dev's 0.5 GB tasks have little memory to spare. Findings are exported to the audit bucket. Findings of medium severity or higher (4.0 and above) go through EventBridge to an SNS topic encrypted with the same key, which emails me a one-line summary. The address is a deploy-time parameter and is never committed.
+- **Access logs, in one bucket per environment.** The ALB, CloudFront (standard logs) and the static bucket all log to a bucket in `logging.yaml`, deployed right after the network, so the other stacks can switch logging on when they are created. Delivery to S3 is free for all three, and storage is $0.023 per GB-month. Logs expire after 30 days in dev and 365 in prod. The bucket uses SSE-S3, because ALB access logs cannot be delivered to a KMS-encrypted bucket. It also keeps ACLs enabled, because CloudFront's free standard logs write objects with an ACL. The newer CloudFront logging avoids ACLs, but it costs $0.25 per GB and has to be configured in us-east-1 after the distribution exists. Only the ELB log delivery account for eu-west-1 and the S3 logging service may write here, each under its own prefix.
+- **WAF logs: blocked and counted requests only.** AWS requires WAF's log destination to be in the web ACL's Region, so the log group is in us-east-1, in `edge-global`. It must be named `aws-waf-logs-*`, has 90-day retention, and is encrypted with its own key ($1 a month). The eu-west-1 logs key cannot be used across Regions. Allowed requests already appear in the ALB and CloudFront logs, so a filter keeps only blocked and counted ones, at $0.57 per GB ingested.
+- **Alarms on what users notice first.** All alarms use the free default metrics, at $0.10 each a month: 11 in dev and 13 in prod.
+  - ALB: 5xx returned by the load balancer, 5xx returned by the API, and p95 response time above 1 second for 3 minutes.
+  - Fewer healthy tasks than the service minimum, for 3 minutes. Without Container Insights there is no running-task metric, so this uses healthy targets.
+  - Service CPU or memory above 85% for 15 minutes, which means auto scaling has run out of room.
+  - Database CPU above 80%, free storage below 2 GiB, and more than 60 connections. The pools allow at most 10 per task, so more than 60 means a leak or an unexpected client.
+  - Valkey engine CPU and memory, on each node.
+
+  Each alarm notifies on both trigger and recovery, by email through an SNS topic. That topic uses SNS's default encryption rather than a customer-managed key. CloudWatch alarms cannot publish to a topic encrypted with the AWS-managed SNS key, and alarm messages hold only alarm names and numbers.
+- **One dashboard per environment** ($3 a month) shows the same signals on one page: requests and errors, p50/p95/p99 latency, healthy tasks, service CPU and memory, database CPU and connections, cache hits and misses, and every alarm's state.
 
 ### Planned
 
@@ -166,11 +186,32 @@ At list prices, the edge adds about **$0 a month in dev** and **$9.50 in prod** 
 
 ## Security
 
-Summary here, detail in [SECURITY.md](SECURITY.md). _TBD_
+Detail in [SECURITY.md](SECURITY.md). In short:
+
+- **Nothing private is reachable from the internet.** Only CloudFront (and WAF, in prod) can reach the load balancer. The tasks, database and cache are in private subnets, and each security group admits only the tier in front of it.
+- **No long-lived secrets in the service.**
+  - It connects to the database with 15-minute IAM tokens.
+  - The master password is generated and rotated by RDS, and only the migration task can read it.
+  - The cache token and the origin header are generated by Secrets Manager.
+  - Nothing secret is in a template or in this repository.
+- **Encryption in transit and at rest.** TLS from viewer to CloudFront to the ALB in prod, and to PostgreSQL and Valkey. Customer-managed KMS keys for the data tier, logs and audit trail.
+- **Least-privilege IAM.** Each role allows one job: pull an image, read one secret, or connect as one database user.
+- **Detection.** CloudTrail in every Region with log file validation, GuardDuty with emailed findings, WAF logs of blocked requests, and access logs for the ALB, CloudFront and S3.
 
 ## Observability
 
-_TBD: dashboard screenshot, alarm list, log format._
+Alarms and the dashboard are described under [Security and observability](#security-and-observability-loggingyaml-securityyaml-observabilityyaml-waf-logs-in-edge-globalyaml). Where things are written:
+
+| Signal | Where |
+|---|---|
+| API logs (one JSON line per request, keyed by the ALB trace id) | CloudWatch Logs `/aws-ha-web-platform/<env>/notes-api` (prefixes `api/` and `migrate/`) |
+| ALB, CloudFront and static bucket access logs | `<env>-logging` bucket, prefixes `alb/`, `cloudfront/`, `s3/` |
+| WAF blocked and counted requests (prod) | CloudWatch Logs `aws-waf-logs-prod-notes-edge`, us-east-1 |
+| PostgreSQL log, statements over 1 s (prod) | CloudWatch Logs `/aws/rds/instance/prod-postgres/postgresql` |
+| VPC flow logs (prod) | CloudWatch Logs `/aws-ha-web-platform/prod/vpc-flow-logs` |
+| CloudTrail, GuardDuty findings | Audit bucket from the security stack |
+
+_TBD: dashboard screenshot once deployed._
 
 ## Reliability testing
 
@@ -204,7 +245,7 @@ docker compose --profile app up --build   # API on http://localhost:3000
 
 ## Deploy and teardown
 
-Deploy order, per environment: network → data → registry → push the image (tagged with the commit SHA) → (prod: dns, then delegate the subdomain at the parent's DNS provider) → compute → run the migration task → service up → (prod: edge-global in us-east-1) → edge → sync `static/` to the bucket. On the first deploy, compute is created with `ServiceEnabled=false`, and the migration task creates the `notes_app` database user before the service starts any tasks. Prod's certificates validate only once the delegation is live. Stacks that use the `AWS::LanguageExtensions` transform (data) need `CAPABILITY_AUTO_EXPAND`, and stacks that create IAM roles (network, data, compute) need `CAPABILITY_IAM`. `CloudFrontPrefixListId`, `ImageTag`, the domain name, and the edge-global outputs passed to edge (certificate and web ACL ARNs, which contain the account id) are supplied at deploy time, not stored in the parameter files.
+Once per account: security (eu-west-1). Then, per environment: network → logging → data → registry → push the image (tagged with the commit SHA) → (prod: dns, then delegate the subdomain at the parent's DNS provider) → compute → run the migration task → service up → (prod: edge-global in us-east-1) → edge → sync `static/` to the bucket → observability. On the first deploy, compute is created with `ServiceEnabled=false`, and the migration task creates the `notes_app` database user before the service starts any tasks. Prod's certificates validate only once the delegation is live. Stacks that use the `AWS::LanguageExtensions` transform (data) need `CAPABILITY_AUTO_EXPAND`, and stacks that create IAM roles (network, data, compute) need `CAPABILITY_IAM`. The alert email address for security and observability is supplied at deploy time; AWS emails a confirmation link before it sends anything else. `CloudFrontPrefixListId`, `ImageTag`, the domain name, and the edge-global outputs passed to edge (certificate and web ACL ARNs, which contain the account id) are supplied at deploy time, not stored in the parameter files.
 
 The scripts are still _TBD_. The intended interface:
 

@@ -1,0 +1,316 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  aws-ha-web-platform security stack, deployed once per account (eu-west-1),
+  not per environment. A multi-Region CloudTrail trail and a GuardDuty
+  detector cover dev and prod together; GuardDuty findings of medium
+  severity or higher are emailed through an encrypted SNS topic.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    NoEcho: true
+    AllowedPattern: ^[^@\s]+@[^@\s]+\.[^@\s]+$
+    Description: >-
+      Address that receives GuardDuty findings. Passed at deploy time and
+      never committed; AWS emails a confirmation link first.
+
+  RuntimeMonitoring:
+    Type: String
+    AllowedValues: [enabled, disabled]
+    Default: disabled
+    Description: >-
+      GuardDuty Runtime Monitoring for ECS Fargate. GuardDuty then adds its
+      agent as a sidecar to new tasks ($1.50 per vCPU-month monitored).
+
+  RetentionDays:
+    Type: Number
+    Default: 365
+    AllowedValues: [90, 180, 365]
+    Description: Days to keep CloudTrail logs and exported GuardDuty findings.
+
+Conditions:
+  RuntimeOn: !Equals [!Ref RuntimeMonitoring, enabled]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # One key for the audit trail, exported findings and the alert topic. Each
+  # service may only use it for its own resources in this account.
+  # ---------------------------------------------------------------------------
+  SecurityKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain # audit logs stay readable after a teardown
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: CloudTrail, GuardDuty findings and security alert encryption key
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+          - Sid: CloudTrailEncryptsThisTrailsLogs
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: kms:GenerateDataKey*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/aws-ha-web-platform
+              StringLike:
+                kms:EncryptionContext:aws:cloudtrail:arn: !Sub arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*
+          - Sid: CloudTrailDescribesKey
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: kms:DescribeKey
+            Resource: "*"
+          - Sid: GuardDutyEncryptsExportedFindings
+            Effect: Allow
+            Principal: { Service: guardduty.amazonaws.com }
+            Action: kms:GenerateDataKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:guardduty:${AWS::Region}:${AWS::AccountId}:detector/*
+          - Sid: EventBridgePublishesToTheEncryptedTopic
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: [kms:GenerateDataKey*, kms:Decrypt]
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Tags:
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  SecurityKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/aws-ha-web-platform-security
+      TargetKeyId: !Ref SecurityKey
+
+  # ---------------------------------------------------------------------------
+  # Audit bucket: CloudTrail logs (AWSLogs/) and GuardDuty findings
+  # (guardduty/). Retained on stack deletion.
+  # ---------------------------------------------------------------------------
+  AuditBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >-
+              Access to the audit bucket is itself recorded by the trail
+              (management events); server access logs would need a bucket in
+              this account-level stack only for that.
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt SecurityKey.Arn
+            BucketKeyEnabled: true # one KMS request per object batch, not per object
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-audit-logs
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  AuditBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AuditBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudTrailChecksBucketAcl
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt AuditBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/aws-ha-web-platform
+          - Sid: CloudTrailWritesThisAccountsLogs
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub ${AuditBucket.Arn}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/aws-ha-web-platform
+          - Sid: GuardDutyLocatesBucket
+            Effect: Allow
+            Principal: { Service: guardduty.amazonaws.com }
+            Action: s3:GetBucketLocation
+            Resource: !GetAtt AuditBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:guardduty:${AWS::Region}:${AWS::AccountId}:detector/*
+          - Sid: GuardDutyWritesFindings
+            Effect: Allow
+            Principal: { Service: guardduty.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub ${AuditBucket.Arn}/guardduty/*
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:guardduty:${AWS::Region}:${AWS::AccountId}:detector/*
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt AuditBucket.Arn, !Sub "${AuditBucket.Arn}/*"]
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------------------
+  # CloudTrail: management events in every Region, with digest files so I
+  # can prove a log file was not changed or deleted. The first copy of
+  # management events is free; data events (per-object S3, Lambda) are not
+  # recorded, at $0.10 per 100,000. No SNS notice per log file: it would
+  # fire every few minutes and alert on nothing; GuardDuty analyses the same
+  # events and alerts on findings.
+  # ---------------------------------------------------------------------------
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: AuditBucketPolicy
+    Properties:
+      TrailName: aws-ha-web-platform
+      S3BucketName: !Ref AuditBucket
+      KMSKeyId: !GetAtt SecurityKey.Arn
+      IsLogging: true
+      IsMultiRegionTrail: true # also records activity in us-east-1 (edge) and any Region used by mistake
+      IncludeGlobalServiceEvents: true # IAM, STS, CloudFront
+      EnableLogFileValidation: true
+      Tags:
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  # ---------------------------------------------------------------------------
+  # GuardDuty. Foundational sources (CloudTrail management events, VPC flow
+  # logs, DNS logs) are always on with a detector. Optional plans are listed
+  # explicitly so none is turned on by an account default and billed
+  # silently.
+  # ---------------------------------------------------------------------------
+  Detector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      Features:
+        - Name: RUNTIME_MONITORING
+          Status: !If [RuntimeOn, ENABLED, DISABLED]
+          AdditionalConfiguration: !If
+            - RuntimeOn
+            - - { Name: ECS_FARGATE_AGENT_MANAGEMENT, Status: ENABLED }
+            - !Ref AWS::NoValue
+        - { Name: S3_DATA_EVENTS, Status: DISABLED } # per-object S3 events; buckets here hold logs and public files
+        - { Name: RDS_LOGIN_EVENTS, Status: DISABLED } # IAM tokens and one migration user; revisit with real users
+        - { Name: EBS_MALWARE_PROTECTION, Status: DISABLED } # no EC2 except the dev NAT instance
+        - { Name: EKS_AUDIT_LOGS, Status: DISABLED } # no EKS
+        - { Name: LAMBDA_NETWORK_LOGS, Status: DISABLED } # no Lambda
+      Tags:
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  FindingsExport:
+    Type: AWS::GuardDuty::PublishingDestination
+    DependsOn: AuditBucketPolicy
+    Properties:
+      DetectorId: !Ref Detector
+      DestinationType: S3
+      DestinationProperties:
+        DestinationArn: !Sub ${AuditBucket.Arn}/guardduty
+        KmsKeyArn: !GetAtt SecurityKey.Arn
+
+  # ---------------------------------------------------------------------------
+  # Alerts: GuardDuty severity 4.0 and above (medium, high, critical) by email.
+  # ---------------------------------------------------------------------------
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: aws-ha-web-platform-security-alerts
+      KmsMasterKeyId: !Ref SecurityKey
+      Tags:
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  SecurityAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref SecurityAlertsTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: GuardDutyFindingRuleOnly
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref SecurityAlertsTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt FindingsRule.Arn
+
+  SecurityAlertsEmail:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SecurityAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  FindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: GuardDuty findings of medium severity or higher
+      EventPattern:
+        source: [aws.guardduty]
+        detail-type: [GuardDuty Finding]
+        detail:
+          severity: [{ numeric: [">=", 4] }]
+      Targets:
+        - Id: security-alerts
+          Arn: !Ref SecurityAlertsTopic
+          InputTransformer:
+            InputPathsMap:
+              severity: $.detail.severity
+              type: $.detail.type
+              title: $.detail.title
+              region: $.region
+              id: $.detail.id
+            InputTemplate: >-
+              "GuardDuty <severity> in <region>: <type>. <title>. Finding id <id>."
+
+Outputs:
+  AuditBucketName:
+    Value: !Ref AuditBucket
+  DetectorId:
+    Value: !Ref Detector
+    Export: { Name: !Sub "${AWS::StackName}-DetectorId" }
+  SecurityAlertsTopicArn:
+    Value: !Ref SecurityAlertsTopic
+    Export: { Name: !Sub "${AWS::StackName}-SecurityAlertsTopicArn" }

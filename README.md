@@ -154,7 +154,7 @@ At list prices, the edge adds about **$0 a month in dev** and **$9.50 in prod** 
 - **WAF: three AWS managed rule groups and a rate limit.** In priority order:
   1. Amazon's IP reputation list, which blocks known botnets and scanners before anything else runs.
   2. A per-IP rate limit of 1,000 requests in any 5 minutes.
-  3. The common rule set (OWASP-style protections such as XSS, path traversal and oversized bodies).
+  3. The common rule set (OWASP-style protections such as XSS and path traversal). Its 8 KB body limit is set to count, not block, because a valid note can be larger; the API rejects bodies over 32 KB itself.
   4. Known bad inputs, which covers exploit patterns such as Log4j.
 
   WAF costs $5 per web ACL plus $1 per rule or rule group each month, plus $0.60 per million requests. These four came to $9 a month, against $7 for the common rule set and rate limit alone. Full WAF request logging arrives with the security and observability stack; sampled requests and metrics are on now.

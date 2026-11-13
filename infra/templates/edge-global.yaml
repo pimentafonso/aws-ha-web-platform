@@ -89,9 +89,10 @@ Resources:
             SampledRequestsEnabled: true
             CloudWatchMetricsEnabled: true
             MetricName: rate-limit-per-ip
-        # OWASP-style protections: oversized bodies, XSS, path traversal and
-        # similar. The API caps JSON bodies at 32 KB itself, so the group's
-        # 8 KB body rule is left at its default (block).
+        # OWASP-style protections: XSS, path traversal, bad user agents and
+        # similar. Its 8 KB body limit would block valid notes (content may
+        # be 10,000 characters), so that one rule only counts; the API
+        # rejects bodies over 32 KB itself.
         - Name: aws-common
           Priority: 2
           OverrideAction: { None: {} }
@@ -99,6 +100,9 @@ Resources:
             ManagedRuleGroupStatement:
               VendorName: AWS
               Name: AWSManagedRulesCommonRuleSet
+              RuleActionOverrides:
+                - Name: SizeRestrictions_BODY
+                  ActionToUse: { Count: {} }
           VisibilityConfig:
             SampledRequestsEnabled: true
             CloudWatchMetricsEnabled: true

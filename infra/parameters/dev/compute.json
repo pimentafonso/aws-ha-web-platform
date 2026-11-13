@@ -1,0 +1,14 @@
+[
+  { "ParameterKey": "EnvironmentName", "ParameterValue": "dev" },
+  { "ParameterKey": "NetworkStackName", "ParameterValue": "dev-network" },
+  { "ParameterKey": "DataStackName", "ParameterValue": "dev-data" },
+  { "ParameterKey": "RegistryStackName", "ParameterValue": "dev-registry" },
+  { "ParameterKey": "LoggingMode", "ParameterValue": "minimal" },
+  { "ParameterKey": "AlbDeletionProtection", "ParameterValue": "false" },
+  { "ParameterKey": "TaskCpu", "ParameterValue": "256" },
+  { "ParameterKey": "TaskMemory", "ParameterValue": "512" },
+  { "ParameterKey": "MinTasks", "ParameterValue": "1" },
+  { "ParameterKey": "MaxTasks", "ParameterValue": "2" },
+  { "ParameterKey": "ContainerInsights", "ParameterValue": "disabled" },
+  { "ParameterKey": "LogRetentionDays", "ParameterValue": "30" }
+]

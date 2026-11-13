@@ -1,0 +1,7 @@
+[
+  { "ParameterKey": "EnvironmentName", "ParameterValue": "dev" },
+  { "ParameterKey": "ComputeStackName", "ParameterValue": "dev-compute" },
+  { "ParameterKey": "DataStackName", "ParameterValue": "dev-data" },
+  { "ParameterKey": "MinTasks", "ParameterValue": "1" },
+  { "ParameterKey": "CacheNodeCount", "ParameterValue": "1" }
+]

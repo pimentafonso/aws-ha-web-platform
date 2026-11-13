@@ -1,0 +1,7 @@
+[
+  { "ParameterKey": "EnvironmentName", "ParameterValue": "dev" },
+  { "ParameterKey": "ComputeStackName", "ParameterValue": "dev-compute" },
+  { "ParameterKey": "DnsStackName", "ParameterValue": "" },
+  { "ParameterKey": "ViewerCertificateArn", "ParameterValue": "" },
+  { "ParameterKey": "WebAclArn", "ParameterValue": "" }
+]

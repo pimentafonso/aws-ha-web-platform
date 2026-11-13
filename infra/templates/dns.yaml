@@ -1,0 +1,42 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  aws-ha-web-platform dns stack. A Route 53 public hosted zone for the
+  platform's subdomain (for example platform.<my domain>). The parent domain
+  stays where it is; the subdomain is delegated here by adding this zone's
+  name servers as NS records at the parent's DNS provider. Prod only: dev uses
+  the CloudFront default domain.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedValues: [prod]
+    Description: Only prod has a domain.
+
+  DomainName:
+    Type: String
+    AllowedPattern: ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$
+    ConstraintDescription: Lower-case DNS name without a trailing dot, e.g. platform.example.com.
+    Description: >-
+      Subdomain to host here. Passed at deploy time and never committed.
+
+Resources:
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref DomainName
+      HostedZoneConfig:
+        Comment: !Sub aws-ha-web-platform ${EnvironmentName}, delegated from the parent domain
+      HostedZoneTags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+Outputs:
+  HostedZoneId:
+    Value: !Ref HostedZone
+    Export: { Name: !Sub "${AWS::StackName}-HostedZoneId" }
+  DomainName:
+    Value: !Ref DomainName
+    Export: { Name: !Sub "${AWS::StackName}-DomainName" }
+  NameServers:
+    Description: Add these as NS records for the subdomain at the parent domain's DNS provider.
+    Value: !Join [",", !GetAtt HostedZone.NameServers]

@@ -4,6 +4,7 @@
   { "ParameterKey": "DataStackName", "ParameterValue": "prod-data" },
   { "ParameterKey": "RegistryStackName", "ParameterValue": "prod-registry" },
   { "ParameterKey": "LoggingMode", "ParameterValue": "full" },
+  { "ParameterKey": "DnsStackName", "ParameterValue": "prod-dns" },
   { "ParameterKey": "AlbDeletionProtection", "ParameterValue": "true" },
   { "ParameterKey": "TaskCpu", "ParameterValue": "512" },
   { "ParameterKey": "TaskMemory", "ParameterValue": "1024" },

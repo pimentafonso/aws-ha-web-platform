@@ -1,0 +1,277 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  aws-ha-web-platform edge stack (eu-west-1). CloudFront distribution in
+  front of the API (ALB) and a private S3 bucket of static files, plus the
+  DNS records for the platform's domain in prod. CloudFront is global, so the
+  distribution can live in this Region's stack and read the origin header
+  secret, which stays in eu-west-1.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Environment }
+        Parameters: [EnvironmentName, ComputeStackName, DnsStackName]
+      - Label: { default: "From the edge-global stack (us-east-1, prod only)" }
+        Parameters: [ViewerCertificateArn, WebAclArn]
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Environment name, used in resource names and tags.
+
+  ComputeStackName:
+    Type: String
+    AllowedPattern: ^[A-Za-z][A-Za-z0-9-]*$
+    Description: Name of the deployed compute stack (API origin and its protocol).
+
+  DnsStackName:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^[A-Za-z][A-Za-z0-9-]*$
+    Description: >-
+      dns stack (hosted zone). Empty = no custom domain: viewers use the
+      distribution's *.cloudfront.net name (dev).
+
+  ViewerCertificateArn:
+    Type: String
+    AllowedPattern: ^$|^arn:aws[a-z-]*:acm:us-east-1:\d{12}:certificate/[0-9a-f-]+$
+    Description: >-
+      Viewer certificate from the edge-global stack (us-east-1). Required with
+      a domain; dev passes an empty value.
+
+  WebAclArn:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^arn:aws[a-z-]*:wafv2:us-east-1:\d{12}:global/webacl/.+$
+    Description: CLOUDFRONT-scope web ACL from the edge-global stack. Empty = no WAF (dev).
+
+Rules:
+  ProdHasDomainAndWaf:
+    RuleCondition: !Equals [!Ref EnvironmentName, prod]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref DnsStackName, ""]]
+        AssertDescription: prod needs DnsStackName.
+      - Assert: !Not [!Equals [!Ref ViewerCertificateArn, ""]]
+        AssertDescription: prod needs ViewerCertificateArn.
+      - Assert: !Not [!Equals [!Ref WebAclArn, ""]]
+        AssertDescription: prod needs WebAclArn.
+  DomainNeedsCertificate:
+    RuleCondition: !Not [!Equals [!Ref DnsStackName, ""]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref ViewerCertificateArn, ""]]
+        AssertDescription: a custom domain needs ViewerCertificateArn.
+
+Conditions:
+  HasDomain: !Not [!Equals [!Ref DnsStackName, ""]]
+  HasWaf: !Not [!Equals [!Ref WebAclArn, ""]]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Static files. Private: Block Public Access on, no website hosting, and the
+  # bucket policy lets only this distribution read objects (origin access
+  # control, SigV4-signed requests).
+  # ---------------------------------------------------------------------------
+  StaticBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >-
+              S3 server access logs need a logging bucket, which arrives with
+              the security and observability stack (M2.5). CloudTrail data
+              events are the alternative considered there.
+    Properties:
+      # SSE-S3 rather than SSE-KMS: the files are public web content served to
+      # anyone through CloudFront, so a customer-managed key ($1 a month plus
+      # a key policy for CloudFront) would protect nothing.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced # ACLs disabled
+      VersioningConfiguration:
+        Status: Enabled # a bad sync can be rolled back
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  StaticBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudFrontReadsThroughThisDistributionOnly
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub ${StaticBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt StaticBucket.Arn, !Sub "${StaticBucket.Arn}/*"]
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  StaticOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${EnvironmentName}-notes-static
+        Description: CloudFront signs its requests to the static bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---------------------------------------------------------------------------
+  # Distribution. Default behaviour: the API on the ALB, never cached, every
+  # method, with the secret origin header. /static/*: S3, cached.
+  # Managed policy ids are fixed AWS values, the same in every account.
+  # ---------------------------------------------------------------------------
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_86
+            comment: >-
+              Standard logs need a logging destination, which arrives with the
+              security and observability stack (M2.5).
+          - id: CKV_AWS_174
+            comment: >-
+              With a domain (prod) the viewer certificate uses
+              TLSv1.2_2021. Dev uses the *.cloudfront.net default certificate,
+              where CloudFront does not let me set the minimum protocol.
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub aws-ha-web-platform ${EnvironmentName}
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100 # North America and Europe edge locations
+        Aliases: !If
+          - HasDomain
+          - [!ImportValue { "Fn::Sub": "${DnsStackName}-DomainName" }]
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - HasDomain
+          - AcmCertificateArn: !Ref ViewerCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        WebACLId: !If [HasWaf, !Ref WebAclArn, !Ref AWS::NoValue]
+        Origins:
+          - Id: api
+            DomainName: !ImportValue
+              Fn::Sub: ${ComputeStackName}-OriginDomainName
+            CustomOriginConfig:
+              OriginProtocolPolicy: !ImportValue
+                Fn::Sub: ${ComputeStackName}-OriginProtocol
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                # Same Region as the secret, so a dynamic reference works.
+                HeaderValue: !Sub "{{resolve:secretsmanager:aws-ha-web-platform/${EnvironmentName}/origin-verify}}"
+          - Id: static
+            DomainName: !GetAtt StaticBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt StaticOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: "" # OAC replaces the legacy origin access identity
+        DefaultCacheBehavior:
+          TargetOriginId: api
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy
+        CacheBehaviors:
+          - PathPattern: /static/*
+            TargetOriginId: static
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+            ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  # ---------------------------------------------------------------------------
+  # DNS (prod): the platform's name points at CloudFront over IPv4 and IPv6.
+  # Z2FDTNDATAQYW2 is CloudFront's fixed hosted zone id for alias records.
+  # ---------------------------------------------------------------------------
+  RecordIpv4:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDomain
+    Properties:
+      HostedZoneId: !ImportValue
+        Fn::Sub: ${DnsStackName}-HostedZoneId
+      Name: !ImportValue
+        Fn::Sub: ${DnsStackName}-DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+  RecordIpv6:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDomain
+    Properties:
+      HostedZoneId: !ImportValue
+        Fn::Sub: ${DnsStackName}-HostedZoneId
+      Name: !ImportValue
+        Fn::Sub: ${DnsStackName}-DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+Outputs:
+  DistributionId:
+    Value: !Ref Distribution
+    Export: { Name: !Sub "${AWS::StackName}-DistributionId" }
+  DistributionDomainName:
+    Value: !GetAtt Distribution.DomainName
+    Export: { Name: !Sub "${AWS::StackName}-DistributionDomainName" }
+  StaticBucketName:
+    Description: The deploy script syncs static/ to s3://<bucket>/static/.
+    Value: !Ref StaticBucket
+    Export: { Name: !Sub "${AWS::StackName}-StaticBucketName" }
+  SiteUrl:
+    Value: !If
+      - HasDomain
+      - !Sub https://${RecordIpv4}
+      - !Sub https://${Distribution.DomainName}

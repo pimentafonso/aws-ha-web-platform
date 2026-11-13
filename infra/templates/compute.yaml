@@ -12,7 +12,7 @@ Metadata:
       - Label: { default: Environment }
         Parameters: [EnvironmentName, NetworkStackName, DataStackName, RegistryStackName, LoggingMode]
       - Label: { default: Load balancer }
-        Parameters: [CloudFrontPrefixListId, AlbCertificateArn, AlbDeletionProtection]
+        Parameters: [CloudFrontPrefixListId, DnsStackName, AlbDeletionProtection]
       - Label: { default: Service }
         Parameters:
           - ImageTag
@@ -61,12 +61,15 @@ Parameters:
       Id of the AWS-managed prefix list com.amazonaws.global.cloudfront.origin-facing
       in this Region. The deploy script looks it up; it is not account-specific.
 
-  AlbCertificateArn:
+  DnsStackName:
     Type: String
     Default: ""
+    AllowedPattern: ^$|^[A-Za-z][A-Za-z0-9-]*$
     Description: >-
-      ACM certificate (this Region) for an HTTPS listener on 443. Empty = HTTP
-      on 80 only, until the edge stack provides the domain and certificate.
+      Name of the deployed dns stack (hosted zone). When set, this stack issues
+      an ACM certificate for origin.<domain>, points that name at the ALB and
+      serves HTTPS on 443. Empty = HTTP on 80 with the ALB's own DNS name
+      (dev, which has no domain).
 
   AlbDeletionProtection:
     Type: String
@@ -133,17 +136,17 @@ Parameters:
     Description: Retention of the application log group, in days.
 
 Rules:
-  # Plain HTTP between CloudFront and the ALB is only for dev, before the
-  # edge stack exists. Prod refuses to deploy without a certificate.
+  # Plain HTTP between CloudFront and the ALB is only for dev, which has no
+  # domain. Prod refuses to deploy without one, and so without HTTPS.
   ProdRequiresHttps:
     RuleCondition: !Equals [!Ref EnvironmentName, prod]
     Assertions:
-      - Assert: !Not [!Equals [!Ref AlbCertificateArn, ""]]
-        AssertDescription: prod needs AlbCertificateArn (HTTPS from CloudFront to the ALB).
+      - Assert: !Not [!Equals [!Ref DnsStackName, ""]]
+        AssertDescription: prod needs DnsStackName (origin certificate, HTTPS from CloudFront to the ALB).
 
 Conditions:
   FullLogging: !Equals [!Ref LoggingMode, full]
-  HasCertificate: !Not [!Equals [!Ref AlbCertificateArn, ""]]
+  HasCertificate: !Not [!Equals [!Ref DnsStackName, ""]]
   ServiceOn: !Equals [!Ref ServiceEnabled, "true"]
 
 Resources:
@@ -268,9 +271,9 @@ Resources:
         skip:
           - id: CKV_AWS_2
             comment: >-
-              HTTPS whenever AlbCertificateArn is set, and the ProdRequiresHttps
-              rule makes it mandatory in prod. HTTP is allowed in dev only, to
-              test the service before the edge stack provides a certificate.
+              HTTPS whenever DnsStackName is set, and the ProdRequiresHttps
+              rule makes it mandatory in prod. HTTP is used in dev only, which
+              has no domain; CloudFront still adds the origin header there.
           - id: CKV_AWS_103
             comment: >-
               Same listener: with a certificate it uses
@@ -283,7 +286,7 @@ Resources:
       SslPolicy: !If [HasCertificate, ELBSecurityPolicy-TLS13-1-2-2021-06, !Ref AWS::NoValue]
       Certificates: !If
         - HasCertificate
-        - [{ CertificateArn: !Ref AlbCertificateArn }]
+        - [{ CertificateArn: !Ref OriginCertificate }]
         - !Ref AWS::NoValue
       # Anything without the origin header is refused.
       DefaultActions:
@@ -292,6 +295,45 @@ Resources:
             StatusCode: "403"
             ContentType: application/json
             MessageBody: '{"error":"forbidden"}'
+
+  # origin.<domain>: the name CloudFront connects to, so the TLS certificate
+  # it checks matches. ACM validates it through a record it writes in the
+  # hosted zone, and renews it automatically.
+  OriginCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasCertificate
+    Properties:
+      DomainName: !Sub
+        - origin.${Domain}
+        - Domain: !ImportValue
+            Fn::Sub: ${DnsStackName}-DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Sub
+            - origin.${Domain}
+            - Domain: !ImportValue
+                Fn::Sub: ${DnsStackName}-DomainName
+          HostedZoneId: !ImportValue
+            Fn::Sub: ${DnsStackName}-HostedZoneId
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  OriginRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasCertificate
+    Properties:
+      HostedZoneId: !ImportValue
+        Fn::Sub: ${DnsStackName}-HostedZoneId
+      Name: !Sub
+        - origin.${Domain}
+        - Domain: !ImportValue
+            Fn::Sub: ${DnsStackName}-DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
 
   ForwardFromCloudFront:
     Type: AWS::ElasticLoadBalancingV2::ListenerRule
@@ -662,11 +704,14 @@ Resources:
 
 Outputs:
   LoadBalancerDnsName:
-    Description: CloudFront origin domain (the edge stack imports it).
     Value: !GetAtt LoadBalancer.DNSName
     Export: { Name: !Sub "${AWS::StackName}-LoadBalancerDnsName" }
+  OriginDomainName:
+    Description: Name CloudFront uses for the API origin (the edge stack imports it).
+    Value: !If [HasCertificate, !Ref OriginRecord, !GetAtt LoadBalancer.DNSName]
+    Export: { Name: !Sub "${AWS::StackName}-OriginDomainName" }
   OriginProtocol:
-    Description: http-only until a certificate is set, then https-only.
+    Description: http-only without a domain (dev), https-only with one (prod).
     Value: !If [HasCertificate, https-only, http-only]
     Export: { Name: !Sub "${AWS::StackName}-OriginProtocol" }
   OriginVerifySecretArn:

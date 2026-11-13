@@ -1,0 +1,14 @@
+[
+  { "ParameterKey": "EnvironmentName", "ParameterValue": "prod" },
+  { "ParameterKey": "NetworkStackName", "ParameterValue": "prod-network" },
+  { "ParameterKey": "DataStackName", "ParameterValue": "prod-data" },
+  { "ParameterKey": "RegistryStackName", "ParameterValue": "prod-registry" },
+  { "ParameterKey": "LoggingMode", "ParameterValue": "full" },
+  { "ParameterKey": "AlbDeletionProtection", "ParameterValue": "true" },
+  { "ParameterKey": "TaskCpu", "ParameterValue": "512" },
+  { "ParameterKey": "TaskMemory", "ParameterValue": "1024" },
+  { "ParameterKey": "MinTasks", "ParameterValue": "2" },
+  { "ParameterKey": "MaxTasks", "ParameterValue": "4" },
+  { "ParameterKey": "ContainerInsights", "ParameterValue": "disabled" },
+  { "ParameterKey": "LogRetentionDays", "ParameterValue": "365" }
+]

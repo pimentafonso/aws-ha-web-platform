@@ -451,6 +451,12 @@ Outputs:
   DbName:
     Value: !Ref DbName
     Export: { Name: !Sub "${AWS::StackName}-DbName" }
+  DbResourceId:
+    Description: >-
+      Stable resource id of the instance, used in rds-db:connect policies
+      (arn:aws:rds-db:region:account:dbuser:<id>/<user>) for IAM authentication.
+    Value: !GetAtt Database.DbiResourceId
+    Export: { Name: !Sub "${AWS::StackName}-DbResourceId" }
   DbSecretArn:
     Description: RDS-managed secret holding the master username and password (JSON keys username, password).
     Value: !GetAtt Database.MasterUserSecret.SecretArn

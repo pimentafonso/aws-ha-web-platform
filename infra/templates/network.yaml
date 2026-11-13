@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   aws-ha-web-platform network stack. VPC with public, private-app and
-  private-data subnets in two Availability Zones, NAT Gateway(s), VPC endpoints
-  and KMS-encrypted VPC flow logs. Later stacks import its exports.
+  private-data subnets in two Availability Zones, NAT (managed gateways or
+  low-cost NAT instances), VPC endpoints and optional KMS-encrypted VPC flow
+  logs. Later stacks import its exports.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -11,10 +12,10 @@ Metadata:
         Parameters: [EnvironmentName]
       - Label: { default: Addressing }
         Parameters: [VpcCidr]
-      - Label: { default: Cost and availability }
-        Parameters: [NatGatewayCount, EnableInterfaceEndpoints]
-      - Label: { default: Logging }
-        Parameters: [FlowLogRetentionDays]
+      - Label: { default: Outbound internet (NAT) }
+        Parameters: [NatMode, NatCount, NatInstanceType, NatInstanceAmiId]
+      - Label: { default: Endpoints and logging }
+        Parameters: [EnableInterfaceEndpoints, LoggingMode, FlowLogRetentionDays]
 
 Parameters:
   EnvironmentName:
@@ -31,79 +32,70 @@ Parameters:
       VPC CIDR. It is split into /24 subnets: public a/b, private-app a/b,
       private-data a/b.
 
-  NatGatewayCount:
+  NatMode:
+    Type: String
+    AllowedValues: [gateway, instance]
+    Description: >-
+      gateway = managed NAT Gateway (scales and heals itself, about 10x the
+      price). instance = a small EC2 instance doing NAT with iptables (cheap,
+      but I own its patching and it is not self-healing).
+
+  NatCount:
     Type: Number
     AllowedValues: [1, 2]
     Description: >-
-      1 = one NAT Gateway shared by both AZs (cheaper; losing AZ a cuts outbound
-      internet for AZ b). 2 = one per AZ (no cross-AZ dependency).
+      1 = one NAT shared by both AZs (losing AZ a cuts outbound internet for
+      AZ b). 2 = one per AZ (no cross-AZ dependency).
+
+  NatInstanceType:
+    Type: String
+    Default: t4g.nano
+    AllowedValues: [t4g.nano, t4g.micro, t4g.small]
+    Description: Instance type when NatMode is instance (Graviton, arm64).
+
+  NatInstanceAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: >-
+      Latest Amazon Linux 2023 arm64 AMI, resolved from AWS's public SSM
+      parameter at deploy time. Only used when NatMode is instance.
 
   EnableInterfaceEndpoints:
     Type: String
     AllowedValues: ["true", "false"]
     Description: >-
       Create interface endpoints for ECR (api, dkr), CloudWatch Logs and Secrets
-      Manager in both AZs. When false, that traffic goes through the NAT Gateway.
+      Manager in both AZs. When false, that traffic goes through NAT.
+
+  LoggingMode:
+    Type: String
+    AllowedValues: [full, minimal]
+    Description: >-
+      full = VPC flow logs to a log group encrypted with a customer-managed KMS
+      key, which is also exported for later stacks. minimal = no flow logs and
+      no KMS key; later stacks use CloudWatch Logs' default encryption.
 
   FlowLogRetentionDays:
     Type: Number
+    Default: 365
     AllowedValues: [7, 14, 30, 60, 90, 180, 365]
-    Description: Retention of the VPC flow log group, in days.
+    Description: Retention of the VPC flow log group, in days (full logging only).
 
 Conditions:
-  TwoNatGateways: !Equals [!Ref NatGatewayCount, 2]
+  TwoNats: !Equals [!Ref NatCount, 2]
+  UseNatGateway: !Equals [!Ref NatMode, gateway]
+  UseNatInstance: !Equals [!Ref NatMode, instance]
+  NatGatewayB: !And [!Condition UseNatGateway, !Condition TwoNats]
+  NatInstanceB: !And [!Condition UseNatInstance, !Condition TwoNats]
   CreateInterfaceEndpoints: !Equals [!Ref EnableInterfaceEndpoints, "true"]
+  FullLogging: !Equals [!Ref LoggingMode, full]
 
 Resources:
   # ---------------------------------------------------------------------------
-  # KMS key for CloudWatch Logs. Exported so the compute stack's log groups can
-  # reuse it instead of paying for a second key.
-  # ---------------------------------------------------------------------------
-  LogsKey:
-    Type: AWS::KMS::Key
-    Properties:
-      Description: !Sub ${EnvironmentName} CloudWatch Logs encryption key
-      EnableKeyRotation: true
-      PendingWindowInDays: 7
-      KeyPolicy:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: AccountAdministration
-            Effect: Allow
-            Principal:
-              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
-            Action: kms:*
-            Resource: "*"
-          - Sid: CloudWatchLogsInThisAccountAndRegion
-            Effect: Allow
-            Principal:
-              Service: !Sub logs.${AWS::Region}.amazonaws.com
-            Action:
-              - kms:Encrypt*
-              - kms:Decrypt*
-              - kms:ReEncrypt*
-              - kms:GenerateDataKey*
-              - kms:Describe*
-            Resource: "*"
-            Condition:
-              ArnLike:
-                kms:EncryptionContext:aws:logs:arn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
-      Tags:
-        - { Key: Name, Value: !Sub "${EnvironmentName}-logs" }
-        - { Key: Environment, Value: !Ref EnvironmentName }
-        - { Key: Project, Value: aws-ha-web-platform }
-
-  LogsKeyAlias:
-    Type: AWS::KMS::Alias
-    Properties:
-      AliasName: !Sub alias/${EnvironmentName}-logs
-      TargetKeyId: !Ref LogsKey
-
-  # ---------------------------------------------------------------------------
   # VPC and subnets. /24s carved from the /16 with Fn::Cidr:
   #   0 public-a  1 public-b  2 app-a  3 app-b  4 data-a  5 data-b
-  # No subnet auto-assigns public IPs: the NAT Gateways use Elastic IPs and the
-  # ALB manages its own addresses.
+  # No subnet auto-assigns public IPs: NAT uses Elastic IPs and the ALB manages
+  # its own addresses.
   # ---------------------------------------------------------------------------
   Vpc:
     Type: AWS::EC2::VPC
@@ -241,7 +233,8 @@ Resources:
       RouteTableId: !Ref PublicRouteTable
 
   # ---------------------------------------------------------------------------
-  # NAT: gateway A always; gateway B only when NatGatewayCount is 2.
+  # NAT. The Elastic IPs exist in both modes, so switching NatMode keeps the
+  # platform's outbound addresses.
   # ---------------------------------------------------------------------------
   NatEipA:
     Type: AWS::EC2::EIP
@@ -253,19 +246,9 @@ Resources:
         - { Key: Environment, Value: !Ref EnvironmentName }
         - { Key: Project, Value: aws-ha-web-platform }
 
-  NatGatewayA:
-    Type: AWS::EC2::NatGateway
-    Properties:
-      AllocationId: !GetAtt NatEipA.AllocationId
-      SubnetId: !Ref PublicSubnetA
-      Tags:
-        - { Key: Name, Value: !Sub "${EnvironmentName}-nat-a" }
-        - { Key: Environment, Value: !Ref EnvironmentName }
-        - { Key: Project, Value: aws-ha-web-platform }
-
   NatEipB:
     Type: AWS::EC2::EIP
-    Condition: TwoNatGateways
+    Condition: TwoNats
     DependsOn: InternetGatewayAttachment
     Properties:
       Domain: vpc
@@ -274,9 +257,21 @@ Resources:
         - { Key: Environment, Value: !Ref EnvironmentName }
         - { Key: Project, Value: aws-ha-web-platform }
 
+  # --- NatMode = gateway -----------------------------------------------------
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Condition: UseNatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-nat-a" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
   NatGatewayB:
     Type: AWS::EC2::NatGateway
-    Condition: TwoNatGateways
+    Condition: NatGatewayB
     Properties:
       AllocationId: !GetAtt NatEipB.AllocationId
       SubnetId: !Ref PublicSubnetB
@@ -285,9 +280,190 @@ Resources:
         - { Key: Environment, Value: !Ref EnvironmentName }
         - { Key: Project, Value: aws-ha-web-platform }
 
+  # --- NatMode = instance ----------------------------------------------------
+  # Amazon Linux 2023 on Graviton, NAT done by the kernel with an iptables
+  # MASQUERADE rule. No SSH key and no inbound SSH: shell access is through
+  # SSM Session Manager. Private route tables point at a fixed network
+  # interface rather than at the instance, so a replaced instance only needs
+  # the interface reattached.
+  NatInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UseNatInstance
+    Properties:
+      GroupDescription: NAT instance, forwards HTTPS from the VPC to the internet
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: HTTPS from the VPC, to be forwarded
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+      SecurityGroupEgress:
+        - Description: HTTPS out (forwarded traffic, package updates, SSM)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-nat-instance" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  NatInstanceRole:
+    Type: AWS::IAM::Role
+    Condition: UseNatInstance
+    Properties:
+      Description: NAT instance role, SSM Session Manager access only
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  NatInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: UseNatInstance
+    Properties:
+      Roles: [!Ref NatInstanceRole]
+
+  NatInstanceLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: UseNatInstance
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref NatInstanceAmiId
+        InstanceType: !Ref NatInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt NatInstanceProfile.Arn
+        EbsOptimized: true
+        Monitoring:
+          Enabled: false # detailed monitoring is billed per metric; 5-minute basic is enough
+        MetadataOptions:
+          HttpTokens: required # IMDSv2 only
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 8
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: volume
+            Tags:
+              - { Key: Environment, Value: !Ref EnvironmentName }
+              - { Key: Project, Value: aws-ha-web-platform }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              dnf install -y iptables-services && break
+              sleep 10
+            done
+            echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/90-nat.conf
+            sysctl --system
+            IFACE="$(ip route show default | awk '{print $5; exit}')"
+            iptables -t nat -A POSTROUTING -o "$IFACE" -s ${VpcCidr} -j MASQUERADE
+            iptables-save > /etc/sysconfig/iptables
+            systemctl enable --now iptables
+
+  NatInterfaceA:
+    Type: AWS::EC2::NetworkInterface
+    Condition: UseNatInstance
+    Properties:
+      Description: !Sub ${EnvironmentName} NAT instance a
+      SubnetId: !Ref PublicSubnetA
+      GroupSet: [!Ref NatInstanceSecurityGroup]
+      SourceDestCheck: false # required to forward traffic for other addresses
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-nat-a" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  NatEipAssociationA:
+    Type: AWS::EC2::EIPAssociation
+    Condition: UseNatInstance
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      NetworkInterfaceId: !Ref NatInterfaceA
+
+  NatInstanceA:
+    Type: AWS::EC2::Instance
+    Condition: UseNatInstance
+    DependsOn: NatEipAssociationA # user data needs internet access at boot
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_126
+            comment: >-
+              Detailed monitoring is billed per metric and adds little for a
+              NAT instance; basic 5-minute metrics are enough.
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NatInstanceLaunchTemplate
+        Version: !GetAtt NatInstanceLaunchTemplate.LatestVersionNumber
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          NetworkInterfaceId: !Ref NatInterfaceA
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-nat-a" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  NatInterfaceB:
+    Type: AWS::EC2::NetworkInterface
+    Condition: NatInstanceB
+    Properties:
+      Description: !Sub ${EnvironmentName} NAT instance b
+      SubnetId: !Ref PublicSubnetB
+      GroupSet: [!Ref NatInstanceSecurityGroup]
+      SourceDestCheck: false
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-nat-b" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  NatEipAssociationB:
+    Type: AWS::EC2::EIPAssociation
+    Condition: NatInstanceB
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      NetworkInterfaceId: !Ref NatInterfaceB
+
+  NatInstanceB:
+    Type: AWS::EC2::Instance
+    Condition: NatInstanceB
+    DependsOn: NatEipAssociationB
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_126
+            comment: See NatInstanceA.
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NatInstanceLaunchTemplate
+        Version: !GetAtt NatInstanceLaunchTemplate.LatestVersionNumber
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          NetworkInterfaceId: !Ref NatInterfaceB
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-nat-b" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
   # ---------------------------------------------------------------------------
-  # Private-app routing: one route table per AZ, so switching from one NAT
-  # Gateway to two only changes a route target.
+  # Private-app routing: one route table per AZ. The default route targets the
+  # NAT Gateway or the NAT instance's interface in the same AZ (or AZ a when
+  # NatCount is 1).
   # ---------------------------------------------------------------------------
   PrivateAppRouteTableA:
     Type: AWS::EC2::RouteTable
@@ -312,14 +488,22 @@ Resources:
     Properties:
       RouteTableId: !Ref PrivateAppRouteTableA
       DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref NatGatewayA
+      NatGatewayId: !If [UseNatGateway, !Ref NatGatewayA, !Ref AWS::NoValue]
+      NetworkInterfaceId: !If [UseNatInstance, !Ref NatInterfaceA, !Ref AWS::NoValue]
 
   PrivateAppDefaultRouteB:
     Type: AWS::EC2::Route
     Properties:
       RouteTableId: !Ref PrivateAppRouteTableB
       DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !If [TwoNatGateways, !Ref NatGatewayB, !Ref NatGatewayA]
+      NatGatewayId: !If
+        - UseNatGateway
+        - !If [TwoNats, !Ref NatGatewayB, !Ref NatGatewayA]
+        - !Ref AWS::NoValue
+      NetworkInterfaceId: !If
+        - UseNatInstance
+        - !If [TwoNats, !Ref NatInterfaceB, !Ref NatInterfaceA]
+        - !Ref AWS::NoValue
 
   PrivateAppSubnetARouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -361,8 +545,8 @@ Resources:
   # ---------------------------------------------------------------------------
   # VPC endpoints.
   # S3 gateway endpoint: free. ECR stores image layers in S3, so image pulls
-  # skip the NAT Gateway's per-GB charge. The policy only allows reading the
-  # ECR layer bucket for this Region.
+  # skip NAT. The policy only allows reading the ECR layer bucket for this
+  # Region.
   # ---------------------------------------------------------------------------
   S3GatewayEndpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -397,7 +581,7 @@ Resources:
           CidrIp: !Ref VpcCidr
       SecurityGroupEgress:
         # Endpoints only answer requests (stateful), so they need no egress.
-        # This rule replaces the default allow-all egress rule.
+        # This unmatchable rule replaces the default allow-all egress rule.
         - Description: No egress, placeholder replacing the default allow-all rule
           IpProtocol: icmp
           FromPort: 252
@@ -453,18 +637,54 @@ Resources:
       SecurityGroupIds: [!Ref EndpointSecurityGroup]
 
   # ---------------------------------------------------------------------------
-  # VPC flow logs: all traffic (accepted and rejected) to a KMS-encrypted
-  # CloudWatch Logs group.
+  # LoggingMode = full: KMS key for CloudWatch Logs (exported so the compute
+  # stack's log groups reuse it) and VPC flow logs for all traffic.
   # ---------------------------------------------------------------------------
+  LogsKey:
+    Type: AWS::KMS::Key
+    Condition: FullLogging
+    Properties:
+      Description: !Sub ${EnvironmentName} CloudWatch Logs encryption key
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+          - Sid: CloudWatchLogsInThisAccountAndRegion
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-logs" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  LogsKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: FullLogging
+    Properties:
+      AliasName: !Sub alias/${EnvironmentName}-logs
+      TargetKeyId: !Ref LogsKey
+
   FlowLogGroup:
     Type: AWS::Logs::LogGroup
-    Metadata:
-      checkov:
-        skip:
-          - id: CKV_AWS_338
-            comment: >-
-              Retention is a parameter. prod uses 365 days; dev uses 30 days
-              because it only holds short-lived test traffic.
+    Condition: FullLogging
     Properties:
       LogGroupName: !Sub /aws-ha-web-platform/${EnvironmentName}/vpc-flow-logs
       RetentionInDays: !Ref FlowLogRetentionDays
@@ -475,6 +695,7 @@ Resources:
 
   FlowLogRole:
     Type: AWS::IAM::Role
+    Condition: FullLogging
     Properties:
       Description: Lets VPC Flow Logs write to the flow log group
       AssumeRolePolicyDocument:
@@ -509,6 +730,7 @@ Resources:
 
   VpcFlowLog:
     Type: AWS::EC2::FlowLog
+    Condition: FullLogging
     Properties:
       ResourceType: VPC
       ResourceId: !Ref Vpc
@@ -542,10 +764,16 @@ Outputs:
     Value: !Join [",", [!Ref PrivateDataSubnetA, !Ref PrivateDataSubnetB]]
     Export: { Name: !Sub "${AWS::StackName}-PrivateDataSubnetIds" }
   LogsKeyArn:
-    Description: KMS key for CloudWatch Logs groups in this account and Region.
+    Condition: FullLogging
+    Description: >-
+      KMS key for CloudWatch Logs groups in this account and Region. Only
+      exported when LoggingMode is full; later stacks take LoggingMode as a
+      parameter to decide whether to import it.
     Value: !GetAtt LogsKey.Arn
     Export: { Name: !Sub "${AWS::StackName}-LogsKeyArn" }
-  NatGatewayCount:
-    Value: !If [TwoNatGateways, "2", "1"]
-  InterfaceEndpointsEnabled:
-    Value: !Ref EnableInterfaceEndpoints
+  NatMode:
+    Value: !Ref NatMode
+  NatCount:
+    Value: !Ref NatCount
+  LoggingMode:
+    Value: !Ref LoggingMode

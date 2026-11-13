@@ -1,0 +1,4 @@
+[
+  { "ParameterKey": "RuntimeMonitoring", "ParameterValue": "disabled" },
+  { "ParameterKey": "RetentionDays", "ParameterValue": "365" }
+]

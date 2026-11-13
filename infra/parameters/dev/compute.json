@@ -1,6 +1,7 @@
 [
   { "ParameterKey": "EnvironmentName", "ParameterValue": "dev" },
   { "ParameterKey": "NetworkStackName", "ParameterValue": "dev-network" },
+  { "ParameterKey": "LoggingStackName", "ParameterValue": "dev-logging" },
   { "ParameterKey": "DataStackName", "ParameterValue": "dev-data" },
   { "ParameterKey": "RegistryStackName", "ParameterValue": "dev-registry" },
   { "ParameterKey": "LoggingMode", "ParameterValue": "minimal" },

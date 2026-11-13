@@ -1,5 +1,6 @@
 [
   { "ParameterKey": "EnvironmentName", "ParameterValue": "dev" },
+  { "ParameterKey": "LoggingStackName", "ParameterValue": "dev-logging" },
   { "ParameterKey": "ComputeStackName", "ParameterValue": "dev-compute" },
   { "ParameterKey": "DnsStackName", "ParameterValue": "" },
   { "ParameterKey": "ViewerCertificateArn", "ParameterValue": "" },

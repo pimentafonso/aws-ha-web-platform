@@ -10,7 +10,7 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: { default: Environment }
-        Parameters: [EnvironmentName, ComputeStackName, DnsStackName]
+        Parameters: [EnvironmentName, LoggingStackName, ComputeStackName, DnsStackName]
       - Label: { default: "From the edge-global stack (us-east-1, prod only)" }
         Parameters: [ViewerCertificateArn, WebAclArn]
 
@@ -19,6 +19,11 @@ Parameters:
     Type: String
     AllowedValues: [dev, prod]
     Description: Environment name, used in resource names and tags.
+
+  LoggingStackName:
+    Type: String
+    AllowedPattern: ^[A-Za-z][A-Za-z0-9-]*$
+    Description: Logging stack (bucket for CloudFront and S3 access logs).
 
   ComputeStackName:
     Type: String
@@ -74,15 +79,11 @@ Resources:
   # ---------------------------------------------------------------------------
   StaticBucket:
     Type: AWS::S3::Bucket
-    Metadata:
-      checkov:
-        skip:
-          - id: CKV_AWS_18
-            comment: >-
-              S3 server access logs need a logging bucket, which arrives with
-              the security and observability stack (M2.5). CloudTrail data
-              events are the alternative considered there.
     Properties:
+      LoggingConfiguration:
+        DestinationBucketName: !ImportValue
+          Fn::Sub: ${LoggingStackName}-AccessLogBucketName
+        LogFilePrefix: !Sub s3/${EnvironmentName}-static/
       # SSE-S3 rather than SSE-KMS: the files are public web content served to
       # anyone through CloudFront, so a customer-managed key ($1 a month plus
       # a key policy for CloudFront) would protect nothing.
@@ -157,10 +158,6 @@ Resources:
     Metadata:
       checkov:
         skip:
-          - id: CKV_AWS_86
-            comment: >-
-              Standard logs need a logging destination, which arrives with the
-              security and observability stack (M2.5).
           - id: CKV_AWS_174
             comment: >-
               With a domain (prod) the viewer certificate uses
@@ -171,6 +168,12 @@ Resources:
         Enabled: true
         Comment: !Sub aws-ha-web-platform ${EnvironmentName}
         HttpVersion: http2and3
+        # Standard (legacy) logs: free delivery to the logging bucket.
+        Logging:
+          Bucket: !ImportValue
+            Fn::Sub: ${LoggingStackName}-AccessLogBucketDomainName
+          Prefix: cloudfront/
+          IncludeCookies: false
         IPV6Enabled: true
         PriceClass: PriceClass_100 # North America and Europe edge locations
         Aliases: !If

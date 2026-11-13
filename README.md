@@ -52,7 +52,7 @@ Behaviours that matter for the platform:
 
 ![Current architecture: the Notes API, PostgreSQL and Redis running locally in docker compose](docs/images/architecture-current.svg)
 
-Nothing is deployed to AWS yet. PostgreSQL and Redis stand in locally for RDS and ElastiCache. This diagram is updated as each stack lands.
+Nothing is deployed to AWS yet. PostgreSQL and Redis stand in locally for RDS and ElastiCache. The network stack ([`infra/templates/network.yaml`](infra/templates/network.yaml)) is written and passes lint, but has not been deployed. This diagram is updated as each stack lands.
 
 ### Target
 
@@ -88,14 +88,28 @@ flowchart LR
 
 ## Design decisions and trade-offs
 
-_TBD as each stack lands. Planned topics:_
+Prices quoted below are AWS on-demand list prices for eu-west-1, taken from the AWS Price List on 13 November 2026. They are not measured spend; that goes in [Cost](#cost) once the platform has run.
+
+### Region
+
+Everything runs in **eu-west-1 (Ireland)**, with one exception that AWS imposes: CloudFront only accepts an ACM certificate from **us-east-1**, and a WAF web ACL with `CLOUDFRONT` scope must also be created there. The edge stack therefore deploys that certificate and web ACL to us-east-1 and everything else to eu-west-1.
+
+### Network (`infra/templates/network.yaml`)
+
+- **Three subnet tiers in two AZs.** Public subnets hold only the ALB and the NAT Gateways. Private-app subnets hold the Fargate tasks. Private-data subnets hold RDS and ElastiCache and have **no default route at all**, so even a misconfigured database cannot reach the internet. Each tier gets a /24 per AZ, carved from a /16 with `Fn::Cidr`, which leaves room for more tiers later.
+- **No public IPs by default.** No subnet sets `MapPublicIpOnLaunch`. The NAT Gateways use Elastic IPs and the ALB manages its own addresses, so nothing else can end up with a public IP by accident.
+- **NAT Gateways: one shared in dev, one per AZ in prod** (`NatGatewayCount`). Each NAT Gateway costs $0.048/hour plus $0.048 per GB processed, plus $0.005/hour for its public IPv4 address. With a single NAT Gateway in AZ a, losing AZ a also cuts outbound internet access for AZ b. I accept that in dev to halve the fixed cost. In prod each AZ routes through its own gateway, so an AZ failure stays inside that AZ. Each private-app subnet has its own route table in both environments, so moving from one gateway to two only changes a route target.
+- **S3 gateway endpoint everywhere.** It is free, and ECR stores image layers in S3, so image pulls do not pay the NAT Gateway's per-GB charge. Its endpoint policy only allows `s3:GetObject` on the ECR layer bucket for the Region, because nothing else in the VPC needs S3.
+- **Interface endpoints only in prod** (`EnableInterfaceEndpoints`). Fargate needs ECR (`ecr.api`, `ecr.dkr`), CloudWatch Logs and Secrets Manager. Four endpoints in two AZs cost 8 × $0.011 = $0.088/hour (about $64 a month) plus $0.01 per GB. The NAT Gateway that dev needs anyway already reaches those APIs, so in dev the endpoints would add cost without removing anything. On cost alone, they only pay off against NAT processing ($0.048 vs $0.01 per GB) above roughly 1.7 TB a month, far beyond this project's traffic. I enable them in prod for a different reason: image pulls, secret retrieval and log delivery stay on the AWS network, and they do not depend on the NAT Gateways.
+- **VPC flow logs** capture accepted and rejected traffic for the whole VPC into a CloudWatch Logs group encrypted with a customer-managed KMS key ($1 a month, rotated yearly). Retention is 30 days in dev and 365 in prod. Ingestion is the main variable cost at $0.57 per GB, so the aggregation interval stays at the default 10 minutes. The same key is exported for the application's log groups, so the platform pays for one logs key rather than one per stack.
+- **Cross-stack wiring through exports** named `<stack>-VpcId`, `<stack>-PrivateAppSubnetIds` and so on. The later stacks take the network stack name as a parameter and use `Fn::ImportValue`, and CloudFormation refuses to delete the network stack while anything still imports from it.
+
+### Planned
 
 - **Fargate over EC2:** no instances to patch or bin-pack. The trade-off is a higher per-vCPU price and less control over the host.
 - **Multi-AZ RDS:** synchronous standby and automatic failover, at roughly double the database cost.
 - **CloudFront in front of the ALB:** TLS at the edge, caching, WAF at the edge, and an ALB that only accepts traffic from CloudFront.
-- **NAT Gateway per AZ vs one shared:** availability against cost.
 - **CloudFormation over CDK/Terraform:** _TBD_
-- **Region choice:** _TBD_
 
 ## Security
 

@@ -1,0 +1,7 @@
+[
+  { "ParameterKey": "EnvironmentName", "ParameterValue": "dev" },
+  { "ParameterKey": "VpcCidr", "ParameterValue": "10.10.0.0/16" },
+  { "ParameterKey": "NatGatewayCount", "ParameterValue": "1" },
+  { "ParameterKey": "EnableInterfaceEndpoints", "ParameterValue": "false" },
+  { "ParameterKey": "FlowLogRetentionDays", "ParameterValue": "30" }
+]

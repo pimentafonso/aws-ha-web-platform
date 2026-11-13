@@ -1,0 +1,551 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  aws-ha-web-platform network stack. VPC with public, private-app and
+  private-data subnets in two Availability Zones, NAT Gateway(s), VPC endpoints
+  and KMS-encrypted VPC flow logs. Later stacks import its exports.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Environment }
+        Parameters: [EnvironmentName]
+      - Label: { default: Addressing }
+        Parameters: [VpcCidr]
+      - Label: { default: Cost and availability }
+        Parameters: [NatGatewayCount, EnableInterfaceEndpoints]
+      - Label: { default: Logging }
+        Parameters: [FlowLogRetentionDays]
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Environment name, used in resource names and tags.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/16$
+    ConstraintDescription: Must be an IPv4 /16 block, e.g. 10.0.0.0/16.
+    Description: >-
+      VPC CIDR. It is split into /24 subnets: public a/b, private-app a/b,
+      private-data a/b.
+
+  NatGatewayCount:
+    Type: Number
+    AllowedValues: [1, 2]
+    Description: >-
+      1 = one NAT Gateway shared by both AZs (cheaper; losing AZ a cuts outbound
+      internet for AZ b). 2 = one per AZ (no cross-AZ dependency).
+
+  EnableInterfaceEndpoints:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Create interface endpoints for ECR (api, dkr), CloudWatch Logs and Secrets
+      Manager in both AZs. When false, that traffic goes through the NAT Gateway.
+
+  FlowLogRetentionDays:
+    Type: Number
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+    Description: Retention of the VPC flow log group, in days.
+
+Conditions:
+  TwoNatGateways: !Equals [!Ref NatGatewayCount, 2]
+  CreateInterfaceEndpoints: !Equals [!Ref EnableInterfaceEndpoints, "true"]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # KMS key for CloudWatch Logs. Exported so the compute stack's log groups can
+  # reuse it instead of paying for a second key.
+  # ---------------------------------------------------------------------------
+  LogsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub ${EnvironmentName} CloudWatch Logs encryption key
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+          - Sid: CloudWatchLogsInThisAccountAndRegion
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-logs" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  LogsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${EnvironmentName}-logs
+      TargetKeyId: !Ref LogsKey
+
+  # ---------------------------------------------------------------------------
+  # VPC and subnets. /24s carved from the /16 with Fn::Cidr:
+  #   0 public-a  1 public-b  2 app-a  3 app-b  4 data-a  5 data-b
+  # No subnet auto-assigns public IPs: the NAT Gateways use Elastic IPs and the
+  # ALB manages its own addresses.
+  # ---------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true # required for interface endpoint private DNS
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-vpc" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-igw" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-public-a" }
+        - { Key: Tier, Value: public }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-public-b" }
+        - { Key: Tier, Value: public }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  PrivateAppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-app-a" }
+        - { Key: Tier, Value: private-app }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  PrivateAppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-app-b" }
+        - { Key: Tier, Value: private-app }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  PrivateDataSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-data-a" }
+        - { Key: Tier, Value: private-data }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  PrivateDataSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-data-b" }
+        - { Key: Tier, Value: private-data }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  # ---------------------------------------------------------------------------
+  # Public routing: one route table, default route to the internet gateway.
+  # ---------------------------------------------------------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-public" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------------------------------------------------------------------
+  # NAT: gateway A always; gateway B only when NatGatewayCount is 2.
+  # ---------------------------------------------------------------------------
+  NatEipA:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-nat-a" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-nat-a" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  NatEipB:
+    Type: AWS::EC2::EIP
+    Condition: TwoNatGateways
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-nat-b" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Condition: TwoNatGateways
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-nat-b" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  # ---------------------------------------------------------------------------
+  # Private-app routing: one route table per AZ, so switching from one NAT
+  # Gateway to two only changes a route target.
+  # ---------------------------------------------------------------------------
+  PrivateAppRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-app-a" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  PrivateAppRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-app-b" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  PrivateAppDefaultRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  PrivateAppDefaultRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [TwoNatGateways, !Ref NatGatewayB, !Ref NatGatewayA]
+
+  PrivateAppSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetA
+      RouteTableId: !Ref PrivateAppRouteTableA
+
+  PrivateAppSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetB
+      RouteTableId: !Ref PrivateAppRouteTableB
+
+  # ---------------------------------------------------------------------------
+  # Private-data routing: no default route at all. RDS and ElastiCache only
+  # need to talk to the app subnets, which the implicit local route covers.
+  # ---------------------------------------------------------------------------
+  PrivateDataRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-data" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  PrivateDataSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDataSubnetA
+      RouteTableId: !Ref PrivateDataRouteTable
+
+  PrivateDataSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDataSubnetB
+      RouteTableId: !Ref PrivateDataRouteTable
+
+  # ---------------------------------------------------------------------------
+  # VPC endpoints.
+  # S3 gateway endpoint: free. ECR stores image layers in S3, so image pulls
+  # skip the NAT Gateway's per-GB charge. The policy only allows reading the
+  # ECR layer bucket for this Region.
+  # ---------------------------------------------------------------------------
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds:
+        - !Ref PrivateAppRouteTableA
+        - !Ref PrivateAppRouteTableB
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EcrImageLayers
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::prod-${AWS::Region}-starport-layer-bucket/*
+
+  # Interface endpoints are billed per AZ per hour, so they are optional.
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateInterfaceEndpoints
+    Properties:
+      GroupDescription: HTTPS from inside the VPC to the interface endpoints
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: HTTPS from any address in the VPC
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+      SecurityGroupEgress:
+        # Endpoints only answer requests (stateful), so they need no egress.
+        # This rule replaces the default allow-all egress rule.
+        - Description: No egress, placeholder replacing the default allow-all rule
+          IpProtocol: icmp
+          FromPort: 252
+          ToPort: 86
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-vpc-endpoints" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateInterfaceEndpoints
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateAppSubnetA, !Ref PrivateAppSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateInterfaceEndpoints
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateAppSubnetA, !Ref PrivateAppSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateInterfaceEndpoints
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateAppSubnetA, !Ref PrivateAppSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateInterfaceEndpoints
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateAppSubnetA, !Ref PrivateAppSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # ---------------------------------------------------------------------------
+  # VPC flow logs: all traffic (accepted and rejected) to a KMS-encrypted
+  # CloudWatch Logs group.
+  # ---------------------------------------------------------------------------
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_338
+            comment: >-
+              Retention is a parameter. prod uses 365 days; dev uses 30 days
+              because it only holds short-lived test traffic.
+    Properties:
+      LogGroupName: !Sub /aws-ha-web-platform/${EnvironmentName}/vpc-flow-logs
+      RetentionInDays: !Ref FlowLogRetentionDays
+      KmsKeyId: !GetAtt LogsKey.Arn
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lets VPC Flow Logs write to the flow log group
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc-flow-log/*
+      Policies:
+        - PolicyName: write-flow-log-group
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource:
+                  - !GetAtt FlowLogGroup.Arn
+                  - !Sub "${FlowLogGroup.Arn}:log-stream:*"
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref Vpc
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      MaxAggregationInterval: 600
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-vpc-flow-log" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub "${AWS::StackName}-VpcId" }
+  VpcCidr:
+    Value: !GetAtt Vpc.CidrBlock
+    Export: { Name: !Sub "${AWS::StackName}-VpcCidr" }
+  PublicSubnetIds:
+    Description: Comma-separated, AZ a first. For the ALB.
+    Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+    Export: { Name: !Sub "${AWS::StackName}-PublicSubnetIds" }
+  PrivateAppSubnetIds:
+    Description: Comma-separated, AZ a first. For the Fargate tasks.
+    Value: !Join [",", [!Ref PrivateAppSubnetA, !Ref PrivateAppSubnetB]]
+    Export: { Name: !Sub "${AWS::StackName}-PrivateAppSubnetIds" }
+  PrivateDataSubnetIds:
+    Description: Comma-separated, AZ a first. For RDS and ElastiCache subnet groups.
+    Value: !Join [",", [!Ref PrivateDataSubnetA, !Ref PrivateDataSubnetB]]
+    Export: { Name: !Sub "${AWS::StackName}-PrivateDataSubnetIds" }
+  LogsKeyArn:
+    Description: KMS key for CloudWatch Logs groups in this account and Region.
+    Value: !GetAtt LogsKey.Arn
+    Export: { Name: !Sub "${AWS::StackName}-LogsKeyArn" }
+  NatGatewayCount:
+    Value: !If [TwoNatGateways, "2", "1"]
+  InterfaceEndpointsEnabled:
+    Value: !Ref EnableInterfaceEndpoints

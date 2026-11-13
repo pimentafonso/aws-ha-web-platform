@@ -1,0 +1,476 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# LanguageExtensions lets DeletionPolicy/UpdateReplacePolicy take a parameter,
+# so dev deletes the database on teardown and prod keeps a final snapshot.
+# Deploying needs CAPABILITY_AUTO_EXPAND.
+Transform: AWS::LanguageExtensions
+Description: >-
+  aws-ha-web-platform data stack. RDS PostgreSQL 17 (single-AZ or Multi-AZ)
+  and ElastiCache for Valkey (one node or primary plus replica with automatic
+  failover) in the private-data subnets, a customer-managed KMS key for both,
+  and the application security group that is the only way in. Imports the
+  network stack's exports.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Environment }
+        Parameters: [EnvironmentName, NetworkStackName, LoggingMode]
+      - Label: { default: PostgreSQL }
+        Parameters:
+          - DbInstanceClass
+          - DbMultiAz
+          - DbAllocatedStorage
+          - DbBackupRetentionDays
+          - DbDeletionProtection
+          - DbDeletionPolicy
+          - DbPerformanceInsights
+          - DbName
+          - DbMasterUsername
+      - Label: { default: Valkey }
+        Parameters: [CacheNodeType, CacheNodeCount, CacheSnapshotRetentionDays]
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Environment name, used in resource names and tags.
+
+  NetworkStackName:
+    Type: String
+    AllowedPattern: ^[A-Za-z][A-Za-z0-9-]*$
+    Description: Name of the deployed network stack whose exports this stack imports.
+
+  LoggingMode:
+    Type: String
+    AllowedValues: [full, minimal]
+    Description: >-
+      Must match the network stack. full = export the PostgreSQL log to a
+      log group encrypted with the network stack's logs key. minimal = no
+      database log export.
+
+  DbInstanceClass:
+    Type: String
+    AllowedValues: [db.t4g.micro, db.t4g.small, db.t4g.medium, db.m7g.large]
+    Description: RDS instance class (Graviton).
+
+  DbMultiAz:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Description: >-
+      true = synchronous standby in the other AZ with automatic failover
+      (doubles the instance and storage price).
+
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: gp3 storage in GiB (20 is the RDS minimum).
+
+  DbBackupRetentionDays:
+    Type: Number
+    AllowedValues: [1, 7, 14, 35]
+    Description: Automated backup retention in days.
+
+  DbDeletionProtection:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Description: When true, the database cannot be deleted until this is turned off.
+
+  DbDeletionPolicy:
+    Type: String
+    AllowedValues: [Delete, Snapshot]
+    Description: >-
+      What happens to the database when the stack deletes or replaces it.
+      Snapshot also retains the KMS key, which the snapshot needs.
+
+  DbPerformanceInsights:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Description: Performance Insights with the free 7-day retention, encrypted with the data key.
+
+  DbName:
+    Type: String
+    Default: notes
+    AllowedPattern: ^[a-z][a-z0-9_]{0,62}$
+    Description: Initial database created on the instance.
+
+  DbMasterUsername:
+    Type: String
+    Default: platform_admin
+    AllowedPattern: ^[a-z][a-z0-9_]{0,15}$
+    Description: >-
+      Master user name. The password is generated and rotated by RDS in
+      Secrets Manager and never appears in this template.
+
+  CacheNodeType:
+    Type: String
+    Default: cache.t4g.micro
+    AllowedValues: [cache.t4g.micro, cache.t4g.small, cache.m7g.large]
+    Description: ElastiCache node type (Graviton).
+
+  CacheNodeCount:
+    Type: Number
+    AllowedValues: [1, 2]
+    Description: >-
+      1 = single primary. 2 = primary plus a replica in the other AZ, with
+      automatic failover.
+
+  CacheSnapshotRetentionDays:
+    Type: Number
+    AllowedValues: [0, 1, 7]
+    Description: Daily cache snapshots to keep (0 = none; the cache only holds derived data).
+
+Mappings:
+  # The KMS key must outlive any final database snapshot that it encrypts.
+  KeyPolicyForDbPolicy:
+    Delete: { Value: Delete }
+    Snapshot: { Value: Retain }
+
+Conditions:
+  FullLogging: !Equals [!Ref LoggingMode, full]
+  MultiAz: !Equals [!Ref DbMultiAz, "true"]
+  PerformanceInsights: !Equals [!Ref DbPerformanceInsights, "true"]
+  CacheReplica: !Equals [!Ref CacheNodeCount, 2]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # KMS key for the data tier: RDS storage and Performance Insights, the RDS
+  # master user secret, ElastiCache at rest and the cache auth token secret.
+  # The services use it through grants on behalf of the deploying principal,
+  # which IAM policies allow via the account statement.
+  # ---------------------------------------------------------------------------
+  DataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: !FindInMap [KeyPolicyForDbPolicy, !Ref DbDeletionPolicy, Value]
+    UpdateReplacePolicy: !FindInMap [KeyPolicyForDbPolicy, !Ref DbDeletionPolicy, Value]
+    Properties:
+      Description: !Sub ${EnvironmentName} data tier encryption key (RDS, ElastiCache, secrets)
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-data" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${EnvironmentName}-data
+      TargetKeyId: !Ref DataKey
+
+  # ---------------------------------------------------------------------------
+  # Security groups. The app security group is created here, not in the
+  # compute stack, because the database and cache rules must reference it and
+  # this stack is deployed first. The compute stack imports it, attaches it to
+  # the Fargate service and adds the ALB-to-app ingress rule as a standalone
+  # AWS::EC2::SecurityGroupIngress. This stack defines no inline ingress on it,
+  # so the two stacks never manage the same rule list.
+  #
+  # App egress to the data ports targets the VPC CIDR rather than the database
+  # and cache security groups: referencing them would create a dependency loop
+  # (they reference the app group), and the data groups still only accept the
+  # app group, so nothing else in the VPC is reachable on those ports.
+  # ---------------------------------------------------------------------------
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application tasks (Fargate), the only client of the data tier
+      VpcId: !ImportValue
+        Fn::Sub: ${NetworkStackName}-VpcId
+      SecurityGroupEgress:
+        - Description: HTTPS out (AWS APIs, ECR, Secrets Manager, CloudWatch Logs)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - Description: PostgreSQL to the data tier
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !ImportValue
+            Fn::Sub: ${NetworkStackName}-VpcCidr
+        - Description: Valkey to the data tier
+          IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          CidrIp: !ImportValue
+            Fn::Sub: ${NetworkStackName}-VpcCidr
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-app" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL, reachable only from the app security group
+      VpcId: !ImportValue
+        Fn::Sub: ${NetworkStackName}-VpcId
+      SecurityGroupIngress:
+        - Description: PostgreSQL from the app tasks
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      SecurityGroupEgress:
+        # RDS only answers connections (stateful), so it needs no egress.
+        - Description: No egress, placeholder replacing the default allow-all rule
+          IpProtocol: icmp
+          FromPort: 252
+          ToPort: 86
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-postgres" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Valkey, reachable only from the app security group
+      VpcId: !ImportValue
+        Fn::Sub: ${NetworkStackName}-VpcId
+      SecurityGroupIngress:
+        - Description: Valkey from the app tasks
+          IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      SecurityGroupEgress:
+        - Description: No egress, placeholder replacing the default allow-all rule
+          IpProtocol: icmp
+          FromPort: 252
+          ToPort: 86
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-valkey" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  # ---------------------------------------------------------------------------
+  # RDS PostgreSQL 17.
+  # ---------------------------------------------------------------------------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub ${EnvironmentName} private-data subnets, both AZs
+      SubnetIds: !Split
+        - ","
+        - !ImportValue
+          Fn::Sub: ${NetworkStackName}-PrivateDataSubnetIds
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub ${EnvironmentName} PostgreSQL 17, TLS required
+      Family: postgres17
+      Parameters:
+        rds.force_ssl: "1" # reject unencrypted connections
+        log_min_duration_statement: "1000" # log statements slower than 1 s
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  # Created here rather than by RDS so it has a retention period and, in full
+  # logging mode, the network stack's KMS key. RDS writes to it by name.
+  DbLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: FullLogging
+    Properties:
+      LogGroupName: !Sub /aws/rds/instance/${EnvironmentName}-postgres/postgresql
+      RetentionInDays: 90
+      KmsKeyId: !ImportValue
+        Fn::Sub: ${NetworkStackName}-LogsKeyArn
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  # Enhanced Monitoring publishes OS metrics (per-process CPU, memory, I/O)
+  # every 60 s to CloudWatch Logs. The role only allows RDS to do that.
+  DbMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lets RDS Enhanced Monitoring publish OS metrics to CloudWatch Logs
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: !Ref DbDeletionPolicy
+    UpdateReplacePolicy: !Ref DbDeletionPolicy
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_157
+            comment: >-
+              Multi-AZ is a parameter: prod sets DbMultiAz=true. Dev runs
+              single-AZ on purpose to halve the database cost; it holds only
+              test data and a lost AZ there is acceptable.
+    Properties:
+      DBInstanceIdentifier: !Sub ${EnvironmentName}-postgres
+      Engine: postgres
+      # RDS no longer accepts a bare major version for new instances. Minor
+      # upgrades happen in the maintenance window; bump this pin to match
+      # afterwards so a stack update never asks for an older version.
+      EngineVersion: "17.11"
+      AutoMinorVersionUpgrade: true
+      DBInstanceClass: !Ref DbInstanceClass
+      MultiAZ: !If [MultiAz, true, false]
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      PubliclyAccessible: false
+      Port: "5432"
+      DBParameterGroupName: !Ref DbParameterGroup
+      CACertificateIdentifier: rds-ca-rsa2048-g1 # matches the CA bundle in the app image
+      DBName: !Ref DbName
+      MasterUsername: !Ref DbMasterUsername
+      ManageMasterUserPassword: true
+      MasterUserSecret:
+        KmsKeyId: !Ref DataKey
+      EnableIAMDatabaseAuthentication: true
+      StorageType: gp3
+      AllocatedStorage: !Ref DbAllocatedStorage
+      StorageEncrypted: true
+      KmsKeyId: !Ref DataKey
+      BackupRetentionPeriod: !Ref DbBackupRetentionDays
+      PreferredBackupWindow: "02:00-02:30"
+      PreferredMaintenanceWindow: "sun:03:00-sun:03:30"
+      CopyTagsToSnapshot: true
+      DeleteAutomatedBackups: true
+      DeletionProtection: !Ref DbDeletionProtection
+      EnableCloudwatchLogsExports: !If [FullLogging, [postgresql], !Ref AWS::NoValue]
+      EnablePerformanceInsights: !If [PerformanceInsights, true, false]
+      PerformanceInsightsKMSKeyId: !If [PerformanceInsights, !Ref DataKey, !Ref AWS::NoValue]
+      PerformanceInsightsRetentionPeriod: !If [PerformanceInsights, 7, !Ref AWS::NoValue]
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt DbMonitoringRole.Arn
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-postgres" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+        # Besides recording where the log goes, this reference makes the log
+        # group exist before RDS starts exporting (DependsOn cannot point at a
+        # conditional resource). Otherwise RDS would create it unencrypted.
+        - Key: LogGroup
+          Value: !If [FullLogging, !Ref DbLogGroup, none]
+
+  # ---------------------------------------------------------------------------
+  # ElastiCache for Valkey. Cluster mode disabled: one shard, with an optional
+  # replica in the other AZ that ElastiCache promotes if the primary fails.
+  # ---------------------------------------------------------------------------
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: !Sub ${EnvironmentName} private-data subnets, both AZs
+      SubnetIds: !Split
+        - ","
+        - !ImportValue
+          Fn::Sub: ${NetworkStackName}-PrivateDataSubnetIds
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  # The AUTH token is generated by Secrets Manager and passed to ElastiCache
+  # with a dynamic reference, so it is never in the template or the
+  # parameters. ECS injects it into the tasks as REDIS_PASSWORD.
+  CacheAuthTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub aws-ha-web-platform/${EnvironmentName}/valkey-auth-token
+      Description: !Sub ${EnvironmentName} Valkey AUTH token
+      KmsKeyId: !Ref DataKey
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true # ElastiCache rejects some symbols; letters and digits keep it URL-safe
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  Cache:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub ${EnvironmentName}-valkey
+      ReplicationGroupDescription: !Sub ${EnvironmentName} Valkey cache for the Notes API
+      Engine: valkey
+      EngineVersion: "8.2"
+      AutoMinorVersionUpgrade: true
+      CacheNodeType: !Ref CacheNodeType
+      NumCacheClusters: !Ref CacheNodeCount
+      AutomaticFailoverEnabled: !If [CacheReplica, true, false]
+      MultiAZEnabled: !If [CacheReplica, true, false]
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds: [!Ref CacheSecurityGroup]
+      Port: 6379
+      TransitEncryptionEnabled: true
+      TransitEncryptionMode: required
+      AuthToken: !Sub "{{resolve:secretsmanager:${CacheAuthTokenSecret}}}"
+      AtRestEncryptionEnabled: true
+      KmsKeyId: !Ref DataKey
+      SnapshotRetentionLimit: !Ref CacheSnapshotRetentionDays
+      SnapshotWindow: "02:30-03:30"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-valkey" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+Outputs:
+  DbEndpoint:
+    Description: PostgreSQL writer endpoint (DB_HOST). Follows the primary after a Multi-AZ failover.
+    Value: !GetAtt Database.Endpoint.Address
+    Export: { Name: !Sub "${AWS::StackName}-DbEndpoint" }
+  DbPort:
+    Value: !GetAtt Database.Endpoint.Port
+    Export: { Name: !Sub "${AWS::StackName}-DbPort" }
+  DbName:
+    Value: !Ref DbName
+    Export: { Name: !Sub "${AWS::StackName}-DbName" }
+  DbSecretArn:
+    Description: RDS-managed secret holding the master username and password (JSON keys username, password).
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+    Export: { Name: !Sub "${AWS::StackName}-DbSecretArn" }
+  CacheEndpoint:
+    Description: Valkey primary endpoint. Use rediss:// (TLS is required).
+    Value: !GetAtt Cache.PrimaryEndPoint.Address
+    Export: { Name: !Sub "${AWS::StackName}-CacheEndpoint" }
+  CachePort:
+    Value: !GetAtt Cache.PrimaryEndPoint.Port
+    Export: { Name: !Sub "${AWS::StackName}-CachePort" }
+  CacheAuthSecretArn:
+    Description: Secret holding the Valkey AUTH token (plain string, injected as REDIS_PASSWORD).
+    Value: !Ref CacheAuthTokenSecret
+    Export: { Name: !Sub "${AWS::StackName}-CacheAuthSecretArn" }
+  AppSecurityGroupId:
+    Description: Security group for the Fargate service. The compute stack adds ALB ingress to it.
+    Value: !Ref AppSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-AppSecurityGroupId" }
+  DataKeyArn:
+    Description: KMS key the task execution role must be allowed to decrypt with, to read both secrets.
+    Value: !GetAtt DataKey.Arn
+    Export: { Name: !Sub "${AWS::StackName}-DataKeyArn" }

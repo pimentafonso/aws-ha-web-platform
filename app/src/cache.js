@@ -3,9 +3,14 @@ import { createClient } from 'redis';
 // Cache-aside wrapper. The cache is an optimisation, never a dependency:
 // if Redis is unavailable, reads and writes fall through to Postgres and a
 // warning is logged.
-export function createCache(url, ttlSeconds, logger) {
+//
+// password is the AUTH token. On ElastiCache it comes from Secrets Manager
+// (REDIS_PASSWORD) rather than the URL, because the secret is created before
+// the cache endpoint exists.
+export function createCache(url, ttlSeconds, logger, { password } = {}) {
   const client = createClient({
     url,
+    password,
     socket: {
       connectTimeout: 2000,
       reconnectStrategy: (retries) => Math.min(retries * 200, 5000),

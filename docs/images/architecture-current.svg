@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 730" width="1000" height="730" role="img" aria-labelledby="title desc">
-  <title id="title">Current architecture: local stack; network, data, registry and compute stacks (in code)</title>
-  <desc id="desc">Top: a client calls the Notes API container over HTTP. The API reads and writes PostgreSQL, running migrations under an advisory lock, and uses Redis as a cache-aside layer, all in docker compose on a developer machine. Bottom: the CloudFormation network stack, written and linted but not deployed. A VPC across two Availability Zones has public, private-app and private-data subnets. Private-app subnets route to NAT in the public subnets: a NAT instance in dev, a NAT Gateway per AZ in prod. Data subnets have no default route. An S3 gateway endpoint serves ECR image layers, interface endpoints for ECR, CloudWatch Logs and Secrets Manager exist in prod, and prod sends VPC flow logs to a KMS-encrypted log group. The CloudFormation data stack, also written and linted but not deployed, puts RDS PostgreSQL 17 (single-AZ in dev, Multi-AZ standby in AZ b in prod) and ElastiCache for Valkey (one node in dev, a replica in AZ b in prod) in the data subnets. They accept connections only from the app security group, over TLS, and are encrypted with a KMS data key; the database password and Valkey token live in Secrets Manager. The compute stack, also written and linted but not deployed, adds an Application Load Balancer in the public subnets that accepts only CloudFront, and Arm64 Fargate tasks in both private-app subnets that connect to PostgreSQL with IAM authentication. Images come from an ECR repository in its own registry stack, and migrations run as a one-off ECS task.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 820" width="1000" height="820" role="img" aria-labelledby="title desc">
+  <title id="title">Current architecture: local stack and all AWS stacks up to the edge (in code)</title>
+  <desc id="desc">Top: a client calls the Notes API container over HTTP. The API reads and writes PostgreSQL, running migrations under an advisory lock, and uses Redis as a cache-aside layer, all in docker compose on a developer machine. Bottom: the CloudFormation network stack, written and linted but not deployed. A VPC across two Availability Zones has public, private-app and private-data subnets. Private-app subnets route to NAT in the public subnets: a NAT instance in dev, a NAT Gateway per AZ in prod. Data subnets have no default route. An S3 gateway endpoint serves ECR image layers, interface endpoints for ECR, CloudWatch Logs and Secrets Manager exist in prod, and prod sends VPC flow logs to a KMS-encrypted log group. The CloudFormation data stack, also written and linted but not deployed, puts RDS PostgreSQL 17 (single-AZ in dev, Multi-AZ standby in AZ b in prod) and ElastiCache for Valkey (one node in dev, a replica in AZ b in prod) in the data subnets. They accept connections only from the app security group, over TLS, and are encrypted with a KMS data key; the database password and Valkey token live in Secrets Manager. The compute stack, also written and linted but not deployed, adds an Application Load Balancer in the public subnets that accepts only CloudFront, and Arm64 Fargate tasks in both private-app subnets that connect to PostgreSQL with IAM authentication. Images come from an ECR repository in its own registry stack, and migrations run as a one-off ECS task. In front, written but not deployed: CloudFront with WAF (prod) sends API paths to the ALB with a secret origin header and /static/ paths to a private S3 bucket; Route 53 hosts the delegated subdomain in prod.</desc>
   <style>
     .bg { fill: #ffffff; }
     .box { fill: #e2f3ef; stroke: #0b7a68; stroke-width: 1.6; }
@@ -27,7 +27,7 @@
     </marker>
   </defs>
 
-  <rect class="bg" width="1000" height="730" rx="10"/>
+  <rect class="bg" width="1000" height="820" rx="10"/>
 
   <!-- Local stack (running) -->
   <rect class="box" x="20" y="97" width="170" height="56" rx="6"/>
@@ -60,8 +60,26 @@
   <text class="el" x="626" y="172">GET: cache-aside</text>
   <text class="el" x="626" y="200">DELETE: invalidate</text>
 
-  <!-- Network and data stacks (CloudFormation, linted, not deployed) -->
-  <text class="z" x="20" y="272">CLOUDFORMATION · network + data + registry + compute · WRITTEN AND LINTED, NOT DEPLOYED (dashed)</text>
+  <!-- AWS stacks (CloudFormation, linted, not deployed) -->
+  <text class="z" x="20" y="272">CLOUDFORMATION · ALL STACKS WRITTEN AND LINTED, NOT DEPLOYED (dashed)</text>
+
+  <!-- Edge -->
+  <rect class="box code" x="20" y="285" width="200" height="56" rx="6"/>
+  <text class="t" x="120" y="308" text-anchor="middle">Route 53 (prod)</text>
+  <text class="s" x="120" y="326" text-anchor="middle">delegated subdomain</text>
+  <rect class="box code" x="270" y="285" width="420" height="56" rx="6"/>
+  <text class="t" x="480" y="308" text-anchor="middle">CloudFront · WAF (prod) · HTTPS</text>
+  <text class="s" x="480" y="326" text-anchor="middle">certs + WAF in us-east-1 · adds X-Origin-Verify</text>
+  <rect class="box code" x="740" y="285" width="220" height="56" rx="6"/>
+  <text class="t" x="850" y="308" text-anchor="middle">S3 static (private)</text>
+  <text class="s" x="850" y="326" text-anchor="middle">origin access control</text>
+  <line class="e" x1="220" y1="313" x2="268" y2="313" marker-end="url(#arrow)"/>
+  <line class="e" x1="690" y1="313" x2="738" y2="313" marker-end="url(#arrow)"/>
+  <text class="el" x="714" y="281" text-anchor="middle">/static/*</text>
+  <line class="e" x1="400" y1="341" x2="400" y2="413" marker-end="url(#arrow)"/>
+  <text class="el" x="407" y="362">/api/* → ALB</text>
+
+  <g transform="translate(0,90)">
   <rect class="zone" x="20" y="285" width="960" height="425" rx="10"/>
   <text class="z" x="36" y="306">VPC /16 · eu-west-1</text>
   <text class="z" x="265" y="320" text-anchor="middle">AZ a</text>
@@ -134,4 +152,5 @@
 
   <text class="el" x="130" y="682">ALB: CloudFront only (prefix list + header) · no auto public IPs</text>
   <text class="el" x="130" y="698">dev 10.10.0.0/16 · prod 10.20.0.0/16</text>
+  </g>
 </svg>

@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { createClient } from 'redis';
 import request from 'supertest';
 import { createApp } from '../src/app.js';
 import { createCache } from '../src/cache.js';
@@ -118,5 +119,47 @@ describe('when the cache is unavailable', () => {
   test('/ready stays 200 and reports the cache as down', async () => {
     const res = await request(app).get('/ready').expect(200);
     assert.deepEqual(res.body.checks, { database: true, cache: false });
+  });
+});
+
+describe('when the cache requires an AUTH token', () => {
+  const token = 'local-test-token';
+  let admin;
+
+  before(async () => {
+    admin = await createClient({ url: redisUrl }).connect();
+    await admin.configSet('requirepass', token);
+  });
+
+  after(async () => {
+    // The admin connection stays authenticated, so it can turn AUTH off again.
+    await admin.configSet('requirepass', '');
+    await admin.close();
+  });
+
+  async function readyWithin(cache, ms) {
+    for (let waited = 0; waited < ms; waited += 100) {
+      if (await cache.ping()) return true;
+      await sleep(100);
+    }
+    return false;
+  }
+
+  test('connects when given the token', async () => {
+    const cache = createCache(redisUrl, 60, logger, { password: token });
+    try {
+      assert.equal(await readyWithin(cache, 5000), true);
+    } finally {
+      await cache.close();
+    }
+  });
+
+  test('stays unavailable without the token', async () => {
+    const cache = createCache(redisUrl, 60, logger);
+    try {
+      assert.equal(await readyWithin(cache, 1000), false);
+    } finally {
+      await cache.close();
+    }
   });
 });

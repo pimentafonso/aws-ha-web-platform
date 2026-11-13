@@ -34,6 +34,8 @@ export function loadConfig() {
     },
     // redis:// locally, rediss:// (TLS) against ElastiCache.
     redisUrl: required('REDIS_URL'),
+    // AUTH token, injected from Secrets Manager on ECS. Unset locally.
+    redisPassword: process.env.REDIS_PASSWORD || undefined,
     cacheTtlSeconds: integer('CACHE_TTL_SECONDS', 60),
     shutdownTimeoutMs: integer('SHUTDOWN_TIMEOUT_MS', 20000),
   };

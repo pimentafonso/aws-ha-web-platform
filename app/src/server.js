@@ -11,7 +11,9 @@ const pool = await createPool(config.db);
 pool.on('error', (err) => logger.error({ err: err.message }, 'idle database client error'));
 await migrate(pool, logger);
 
-const cache = createCache(config.redisUrl, config.cacheTtlSeconds, logger);
+const cache = createCache(config.redisUrl, config.cacheTtlSeconds, logger, {
+  password: config.redisPassword,
+});
 const app = createApp({ pool, cache, logger });
 
 const server = app.listen(config.port, () => logger.info({ port: config.port }, 'listening'));

@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  aws-ha-web-platform logging stack. One access-log bucket per environment
+  for the ALB, CloudFront (standard logs) and S3 server access logs.
+  Deployed right after the network stack, so the stacks that log into it
+  can switch logging on when they are created.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Environment name, used in resource names and tags.
+
+  RetentionDays:
+    Type: Number
+    AllowedValues: [30, 90, 365]
+    Description: Days before access logs are deleted.
+
+Mappings:
+  # Elastic Load Balancing writes access logs as an AWS-owned account in each
+  # Region that predates the logdelivery service principal. This is AWS's
+  # documented account for eu-west-1, not one of mine.
+  ElbLogDeliveryAccount:
+    eu-west-1: { AccountId: "156460612806" }
+
+Resources:
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >-
+              This is the access-log bucket. Logging its own access into
+              itself would log every log write; access to it is recorded by
+              CloudTrail instead.
+    Properties:
+      # SSE-S3: ALB access logs can only be delivered to SSE-S3 buckets.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # CloudFront standard (legacy) logging writes objects with an ACL
+      # granting the bucket owner full control, so ACLs must stay enabled on
+      # this bucket. BucketOwnerPreferred makes my account own those objects.
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      VersioningConfiguration:
+        Status: Enabled # a deleted or overwritten log can be recovered for a day
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-logs
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AlbAccessLogs
+            Effect: Allow
+            Principal:
+              AWS: !Sub
+                - arn:${AWS::Partition}:iam::${ElbAccount}:root
+                - ElbAccount: !FindInMap [ElbLogDeliveryAccount, !Ref "AWS::Region", AccountId]
+            Action: s3:PutObject
+            Resource: !Sub ${AccessLogBucket.Arn}/alb/AWSLogs/${AWS::AccountId}/*
+          - Sid: S3ServerAccessLogs
+            Effect: Allow
+            Principal: { Service: logging.s3.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub ${AccessLogBucket.Arn}/s3/*
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt AccessLogBucket.Arn, !Sub "${AccessLogBucket.Arn}/*"]
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+Outputs:
+  AccessLogBucketName:
+    Description: Prefixes alb/, cloudfront/ and s3/<bucket>/.
+    Value: !Ref AccessLogBucket
+    Export: { Name: !Sub "${AWS::StackName}-AccessLogBucketName" }
+  AccessLogBucketDomainName:
+    Description: The form CloudFront's Logging.Bucket property expects (<bucket>.s3.amazonaws.com).
+    Value: !GetAtt AccessLogBucket.DomainName
+    Export: { Name: !Sub "${AWS::StackName}-AccessLogBucketDomainName" }

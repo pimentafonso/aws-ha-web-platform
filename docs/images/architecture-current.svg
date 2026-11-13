@@ -54,7 +54,7 @@
   <text class="el" x="234" y="117" text-anchor="middle">HTTP</text>
 
   <path class="e" d="M510,110 L620,110 L620,80 L738,80" marker-end="url(#arrow)"/>
-  <text class="el" x="626" y="72">SQL · locked migrations</text>
+  <text class="el" x="626" y="72">SQL</text>
 
   <path class="e" d="M510,140 L620,140 L620,180 L738,180" marker-end="url(#arrow)"/>
   <text class="el" x="626" y="172">GET: cache-aside</text>

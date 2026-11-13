@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 650" width="1000" height="650" role="img" aria-labelledby="title desc">
-  <title id="title">Current architecture: local stack and network stack (in code)</title>
-  <desc id="desc">Top: a client calls the Notes API container over HTTP. The API reads and writes PostgreSQL, running migrations under an advisory lock, and uses Redis as a cache-aside layer, all in docker compose on a developer machine. Bottom: the CloudFormation network stack, written and linted but not deployed. A VPC across two Availability Zones has public, private-app and private-data subnets. Private-app subnets route to NAT in the public subnets: a NAT instance in dev, a NAT Gateway per AZ in prod. Data subnets have no default route. An S3 gateway endpoint serves ECR image layers, interface endpoints for ECR, CloudWatch Logs and Secrets Manager exist in prod, and prod sends VPC flow logs to a KMS-encrypted log group.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 730" width="1000" height="730" role="img" aria-labelledby="title desc">
+  <title id="title">Current architecture: local stack, network and data stacks (in code)</title>
+  <desc id="desc">Top: a client calls the Notes API container over HTTP. The API reads and writes PostgreSQL, running migrations under an advisory lock, and uses Redis as a cache-aside layer, all in docker compose on a developer machine. Bottom: the CloudFormation network stack, written and linted but not deployed. A VPC across two Availability Zones has public, private-app and private-data subnets. Private-app subnets route to NAT in the public subnets: a NAT instance in dev, a NAT Gateway per AZ in prod. Data subnets have no default route. An S3 gateway endpoint serves ECR image layers, interface endpoints for ECR, CloudWatch Logs and Secrets Manager exist in prod, and prod sends VPC flow logs to a KMS-encrypted log group. The CloudFormation data stack, also written and linted but not deployed, puts RDS PostgreSQL 17 (single-AZ in dev, Multi-AZ standby in AZ b in prod) and ElastiCache for Valkey (one node in dev, a replica in AZ b in prod) in the data subnets. They accept connections only from the app security group, over TLS, and are encrypted with a KMS data key; the database password and Valkey token live in Secrets Manager.</desc>
   <style>
     .bg { fill: #ffffff; }
     .box { fill: #e2f3ef; stroke: #0b7a68; stroke-width: 1.6; }
@@ -27,7 +27,7 @@
     </marker>
   </defs>
 
-  <rect class="bg" width="1000" height="650" rx="10"/>
+  <rect class="bg" width="1000" height="730" rx="10"/>
 
   <!-- Local stack (running) -->
   <rect class="box" x="20" y="97" width="170" height="56" rx="6"/>
@@ -48,21 +48,21 @@
 
   <rect class="box" x="740" y="152" width="210" height="56" rx="6"/>
   <text class="t" x="845" y="176" text-anchor="middle">Redis 7</text>
-  <text class="s" x="845" y="194" text-anchor="middle">:6389 · stand-in for ElastiCache</text>
+  <text class="s" x="845" y="194" text-anchor="middle">:6389 · stand-in for Valkey</text>
 
   <line class="e" x1="190" y1="125" x2="278" y2="125" marker-end="url(#arrow)"/>
   <text class="el" x="234" y="117" text-anchor="middle">HTTP</text>
 
   <path class="e" d="M510,110 L620,110 L620,80 L738,80" marker-end="url(#arrow)"/>
-  <text class="el" x="626" y="72">SQL · migrations under lock</text>
+  <text class="el" x="626" y="72">SQL · locked migrations</text>
 
   <path class="e" d="M510,140 L620,140 L620,180 L738,180" marker-end="url(#arrow)"/>
   <text class="el" x="626" y="172">GET: cache-aside</text>
   <text class="el" x="626" y="200">DELETE: invalidate</text>
 
-  <!-- Network stack (CloudFormation, linted, not deployed) -->
-  <text class="z" x="20" y="272">CLOUDFORMATION · network.yaml · WRITTEN AND LINTED, NOT DEPLOYED (dashed)</text>
-  <rect class="zone" x="20" y="285" width="960" height="345" rx="10"/>
+  <!-- Network and data stacks (CloudFormation, linted, not deployed) -->
+  <text class="z" x="20" y="272">CLOUDFORMATION · network.yaml + data.yaml · WRITTEN AND LINTED, NOT DEPLOYED (dashed)</text>
+  <rect class="zone" x="20" y="285" width="960" height="425" rx="10"/>
   <text class="z" x="36" y="306">VPC /16 · eu-west-1</text>
   <text class="z" x="265" y="320" text-anchor="middle">AZ a</text>
   <text class="z" x="555" y="320" text-anchor="middle">AZ b</text>
@@ -101,13 +101,24 @@
   <text class="t" x="840" y="443" text-anchor="middle">S3 gateway endpoint</text>
   <text class="s" x="840" y="461" text-anchor="middle">free · ECR layer bucket only</text>
 
-  <rect class="box code" x="130" y="510" width="270" height="56" rx="6"/>
+  <rect class="box code" x="130" y="510" width="270" height="74" rx="6"/>
   <text class="t" x="265" y="533" text-anchor="middle">private-data a · /24</text>
-  <text class="s" x="265" y="551" text-anchor="middle">no default route</text>
+  <text class="s" x="265" y="551" text-anchor="middle">RDS PostgreSQL 17 primary</text>
+  <text class="s" x="265" y="568" text-anchor="middle">Valkey 8.2 primary</text>
 
-  <rect class="box code" x="420" y="510" width="270" height="56" rx="6"/>
+  <rect class="box code" x="420" y="510" width="270" height="74" rx="6"/>
   <text class="t" x="555" y="533" text-anchor="middle">private-data b · /24</text>
-  <text class="s" x="555" y="551" text-anchor="middle">no default route</text>
+  <text class="s" x="555" y="551" text-anchor="middle">RDS Multi-AZ standby (prod)</text>
+  <text class="s" x="555" y="568" text-anchor="middle">Valkey replica, auto failover (prod)</text>
+
+  <line class="e" x1="180" y1="478" x2="180" y2="508" marker-end="url(#arrow)"/>
+  <line class="e" x1="470" y1="478" x2="470" y2="508" marker-end="url(#arrow)"/>
+  <text class="el" x="187" y="497">5432 · 6379 TLS, app SG only</text>
+  <text class="el" x="477" y="497">same rules in AZ b</text>
+
+  <rect class="box code" x="130" y="604" width="560" height="56" rx="6"/>
+  <text class="t" x="410" y="627" text-anchor="middle">KMS data key · Secrets Manager · app security group</text>
+  <text class="s" x="410" y="645" text-anchor="middle">RDS-managed DB password · Valkey AUTH token · SG exported for M2.3</text>
 
   <rect class="box code" x="720" y="496" width="240" height="56" rx="6"/>
   <text class="t" x="840" y="519" text-anchor="middle">Interface endpoints</text>
@@ -117,6 +128,6 @@
   <text class="t" x="840" y="585" text-anchor="middle">VPC flow logs</text>
   <text class="s" x="840" y="603" text-anchor="middle">prod · CloudWatch · KMS key</text>
 
-  <text class="el" x="130" y="600">No subnet auto-assigns public IPs.</text>
-  <text class="el" x="130" y="616">dev 10.10.0.0/16 · prod 10.20.0.0/16</text>
+  <text class="el" x="130" y="682">No subnet auto-assigns public IPs.</text>
+  <text class="el" x="130" y="698">dev 10.10.0.0/16 · prod 10.20.0.0/16</text>
 </svg>

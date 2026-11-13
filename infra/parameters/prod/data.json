@@ -1,0 +1,14 @@
+[
+  { "ParameterKey": "EnvironmentName", "ParameterValue": "prod" },
+  { "ParameterKey": "NetworkStackName", "ParameterValue": "prod-network" },
+  { "ParameterKey": "LoggingMode", "ParameterValue": "full" },
+  { "ParameterKey": "DbInstanceClass", "ParameterValue": "db.t4g.small" },
+  { "ParameterKey": "DbMultiAz", "ParameterValue": "true" },
+  { "ParameterKey": "DbBackupRetentionDays", "ParameterValue": "7" },
+  { "ParameterKey": "DbDeletionProtection", "ParameterValue": "true" },
+  { "ParameterKey": "DbDeletionPolicy", "ParameterValue": "Snapshot" },
+  { "ParameterKey": "DbPerformanceInsights", "ParameterValue": "true" },
+  { "ParameterKey": "CacheNodeType", "ParameterValue": "cache.t4g.micro" },
+  { "ParameterKey": "CacheNodeCount", "ParameterValue": "2" },
+  { "ParameterKey": "CacheSnapshotRetentionDays", "ParameterValue": "1" }
+]

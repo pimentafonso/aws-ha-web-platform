@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Notes API</title>
+  <style>
+    :root { --bg: #f4f6f8; --fg: #16202b; --muted: #5b6774; --line: #c7d0da; --accent: #0b7a68; color-scheme: light dark; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #0f151b; --fg: #e3e9ef; --muted: #93a0ad; --line: #2e3a46; --accent: #45c7ae; } }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    main { max-width: 680px; margin: 0 auto; padding: 48px 16px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; margin-top: 24px; }
+    td { padding: 8px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+    code { font: 14px ui-monospace, Consolas, monospace; color: var(--accent); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Notes API</h1>
+    <p>A small API used to exercise a highly available AWS platform: CloudFront and WAF in front of an Application Load Balancer, ECS Fargate across two Availability Zones, RDS PostgreSQL Multi-AZ and ElastiCache for Valkey. This page is served from S3 through CloudFront; the API paths go to the load balancer.</p>
+    <table>
+      <tr><td><code>GET /health</code></td><td>Liveness</td></tr>
+      <tr><td><code>GET /ready</code></td><td>Database and cache checks</td></tr>
+      <tr><td><code>POST /api/notes</code></td><td>Create a note: <code>{"title": "...", "content": "..."}</code></td></tr>
+      <tr><td><code>GET /api/notes</code></td><td>List recent notes</td></tr>
+      <tr><td><code>GET /api/notes/:id</code></td><td>Read a note (<code>X-Cache</code> shows HIT or MISS)</td></tr>
+      <tr><td><code>DELETE /api/notes/:id</code></td><td>Delete a note</td></tr>
+    </table>
+  </main>
+</body>
+</html>

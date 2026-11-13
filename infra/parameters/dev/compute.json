@@ -4,6 +4,7 @@
   { "ParameterKey": "DataStackName", "ParameterValue": "dev-data" },
   { "ParameterKey": "RegistryStackName", "ParameterValue": "dev-registry" },
   { "ParameterKey": "LoggingMode", "ParameterValue": "minimal" },
+  { "ParameterKey": "DnsStackName", "ParameterValue": "" },
   { "ParameterKey": "AlbDeletionProtection", "ParameterValue": "false" },
   { "ParameterKey": "TaskCpu", "ParameterValue": "256" },
   { "ParameterKey": "TaskMemory", "ParameterValue": "512" },

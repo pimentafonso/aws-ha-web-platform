@@ -48,6 +48,14 @@ Behaviours that matter for the platform:
 
 ## Architecture
 
+### Built so far
+
+![Current architecture: the Notes API, PostgreSQL and Redis running locally in docker compose](docs/images/architecture-current.svg)
+
+Nothing is deployed to AWS yet. PostgreSQL and Redis stand in locally for RDS and ElastiCache. This diagram is updated as each stack lands.
+
+### Target
+
 <!-- TBD: replace with a full-size exported diagram in docs/images/architecture.png -->
 
 ```mermaid

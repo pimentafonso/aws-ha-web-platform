@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 250" width="1000" height="250" role="img" aria-labelledby="title desc">
+  <title id="title">Current architecture: local stack</title>
+  <desc id="desc">A client calls the Notes API container over HTTP. The API reads and writes PostgreSQL, running migrations under an advisory lock, and uses Redis as a cache-aside layer. All three run in docker compose on a developer machine.</desc>
+  <style>
+    .bg { fill: #ffffff; }
+    .box { fill: #e2f3ef; stroke: #0b7a68; stroke-width: 1.6; }
+    .zone { fill: none; stroke: #c7d0da; stroke-width: 1.2; }
+    .t { fill: #16202b; font: 600 14px "Segoe UI", -apple-system, Helvetica, Arial, sans-serif; }
+    .s, .el { fill: #5b6774; font: 12px ui-monospace, "SFMono-Regular", Consolas, monospace; }
+    .z { fill: #5b6774; font: 12px ui-monospace, "SFMono-Regular", Consolas, monospace; letter-spacing: .05em; }
+    .e { stroke: #16202b; stroke-width: 1.4; fill: none; }
+    .head { fill: #16202b; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .box { fill: #143029; stroke: #45c7ae; }
+      .zone { stroke: #30363d; }
+      .t { fill: #e6edf3; }
+      .s, .el, .z { fill: #9aa5b1; }
+      .e { stroke: #e6edf3; }
+      .head { fill: #e6edf3; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1000" height="250" rx="10"/>
+
+  <rect class="box" x="20" y="97" width="170" height="56" rx="6"/>
+  <text class="t" x="105" y="121" text-anchor="middle">curl · npm test</text>
+  <text class="s" x="105" y="139" text-anchor="middle">localhost:3000</text>
+
+  <rect class="zone" x="240" y="20" width="740" height="210" rx="10"/>
+  <text class="z" x="256" y="42">DOCKER COMPOSE (LOCAL)</text>
+
+  <rect class="box" x="280" y="90" width="230" height="70" rx="6"/>
+  <text class="t" x="395" y="113" text-anchor="middle">Notes API</text>
+  <text class="s" x="395" y="131" text-anchor="middle">Node 22 · Express 5</text>
+  <text class="s" x="395" y="147" text-anchor="middle">/health /ready /api/notes</text>
+
+  <rect class="box" x="740" y="52" width="210" height="56" rx="6"/>
+  <text class="t" x="845" y="76" text-anchor="middle">PostgreSQL 17</text>
+  <text class="s" x="845" y="94" text-anchor="middle">:5442 · stand-in for RDS</text>
+
+  <rect class="box" x="740" y="152" width="210" height="56" rx="6"/>
+  <text class="t" x="845" y="176" text-anchor="middle">Redis 7</text>
+  <text class="s" x="845" y="194" text-anchor="middle">:6389 · stand-in for ElastiCache</text>
+
+  <line class="e" x1="190" y1="125" x2="278" y2="125" marker-end="url(#arrow)"/>
+  <text class="el" x="234" y="117" text-anchor="middle">HTTP</text>
+
+  <path class="e" d="M510,110 L620,110 L620,80 L738,80" marker-end="url(#arrow)"/>
+  <text class="el" x="626" y="72">SQL · migrations under lock</text>
+
+  <path class="e" d="M510,140 L620,140 L620,180 L738,180" marker-end="url(#arrow)"/>
+  <text class="el" x="626" y="172">GET: cache-aside</text>
+  <text class="el" x="626" y="200">DELETE: invalidate</text>
+</svg>

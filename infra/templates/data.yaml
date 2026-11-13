@@ -441,6 +441,14 @@ Resources:
         - { Key: Project, Value: aws-ha-web-platform }
 
 Outputs:
+  DbInstanceId:
+    Description: CloudWatch DBInstanceIdentifier dimension.
+    Value: !Ref Database
+    Export: { Name: !Sub "${AWS::StackName}-DbInstanceId" }
+  CacheReplicationGroupId:
+    Description: Node ids are <id>-001 and <id>-002 (CloudWatch CacheClusterId dimension).
+    Value: !Ref Cache
+    Export: { Name: !Sub "${AWS::StackName}-CacheReplicationGroupId" }
   DbEndpoint:
     Description: PostgreSQL writer endpoint (DB_HOST). Follows the primary after a Multi-AZ failover.
     Value: !GetAtt Database.Endpoint.Address

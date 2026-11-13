@@ -1,0 +1,7 @@
+[
+  { "ParameterKey": "EnvironmentName", "ParameterValue": "prod" },
+  { "ParameterKey": "ComputeStackName", "ParameterValue": "prod-compute" },
+  { "ParameterKey": "DataStackName", "ParameterValue": "prod-data" },
+  { "ParameterKey": "MinTasks", "ParameterValue": "2" },
+  { "ParameterKey": "CacheNodeCount", "ParameterValue": "2" }
+]

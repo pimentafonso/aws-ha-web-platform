@@ -1,0 +1,464 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  aws-ha-web-platform observability stack, per environment, deployed last.
+  CloudWatch alarms on the load balancer, the ECS service, RDS and Valkey,
+  emailed through SNS, and one dashboard with the same metrics. Uses only
+  the free default metrics (no Container Insights).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Environment }
+        Parameters: [EnvironmentName, ComputeStackName, DataStackName, AlertEmail]
+      - Label: { default: Shape (must match the compute and data parameter files) }
+        Parameters: [MinTasks, CacheNodeCount]
+      - Label: { default: Thresholds }
+        Parameters: [LatencyP95Seconds, Error5xxPer5Min, DbConnectionsMax, DbFreeStorageMinBytes]
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Environment name, used in resource names and tags.
+
+  ComputeStackName:
+    Type: String
+    AllowedPattern: ^[A-Za-z][A-Za-z0-9-]*$
+    Description: Name of the deployed compute stack.
+
+  DataStackName:
+    Type: String
+    AllowedPattern: ^[A-Za-z][A-Za-z0-9-]*$
+    Description: Name of the deployed data stack.
+
+  AlertEmail:
+    Type: String
+    NoEcho: true
+    AllowedPattern: ^[^@\s]+@[^@\s]+\.[^@\s]+$
+    Description: Address that receives alarms. Passed at deploy time, never committed.
+
+  MinTasks:
+    Type: Number
+    MinValue: 1
+    Description: Same as the compute stack's MinTasks; fewer healthy targets than this raises an alarm.
+
+  CacheNodeCount:
+    Type: Number
+    AllowedValues: [1, 2]
+    Description: Same as the data stack's CacheNodeCount; with 2, the replica gets alarms too.
+
+  LatencyP95Seconds:
+    Type: Number
+    Default: 1
+    Description: p95 target response time (seconds) that counts as slow.
+
+  Error5xxPer5Min:
+    Type: Number
+    Default: 10
+    Description: 5xx responses in 5 minutes that count as an incident.
+
+  DbConnectionsMax:
+    Type: Number
+    Default: 60
+    Description: >-
+      Database connections that count as too many. Each task's pool holds at
+      most 10, so 60 means something other than the service is connecting
+      or pools are leaking.
+
+  DbFreeStorageMinBytes:
+    Type: Number
+    Default: 2147483648
+    Description: Free storage in bytes below which the database alarms (default 2 GiB of the 20).
+
+Conditions:
+  CacheReplica: !Equals [!Ref CacheNodeCount, 2]
+
+Resources:
+  # Alarm notifications only carry alarm names and metric values, so the
+  # topic uses SNS's default encryption: CloudWatch alarms cannot publish to
+  # a topic encrypted with the AWS-managed SNS key, and a customer-managed
+  # key here would add $1 a month per environment for no protected data.
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_26
+            comment: >-
+              Alarm messages hold only alarm names and metric values. The
+              AWS-managed SNS key does not work with CloudWatch alarms, and a
+              customer-managed key would cost $1 a month per environment for
+              no sensitive data. GuardDuty findings, which are sensitive, go
+              to the KMS-encrypted topic in the security stack.
+    Properties:
+      TopicName: !Sub aws-ha-web-platform-${EnvironmentName}-alarms
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlarmTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudWatchAlarmsInThisAccount
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  AlarmEmail:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------------------------------------------------------------------------
+  # Load balancer: what users see. $0.10 per alarm per month.
+  # ---------------------------------------------------------------------------
+  AlbErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-alb-5xx
+      AlarmDescription: The load balancer itself returned 5xx (no healthy target, timeouts).
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !ImportValue { "Fn::Sub": "${ComputeStackName}-LoadBalancerFullName" }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref Error5xxPer5Min
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching # no requests, no errors
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  TargetErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-api-5xx
+      AlarmDescription: The API returned 5xx (unhandled errors, database unavailable).
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !ImportValue { "Fn::Sub": "${ComputeStackName}-LoadBalancerFullName" }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref Error5xxPer5Min
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-api-latency-p95
+      AlarmDescription: p95 response time above the threshold for 3 minutes in a row.
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !ImportValue { "Fn::Sub": "${ComputeStackName}-LoadBalancerFullName" }
+      ExtendedStatistic: p95
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: !Ref LatencyP95Seconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # Without Container Insights there is no running-task metric, so healthy
+  # targets in the target group stand in for it.
+  HealthyTasksAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-healthy-tasks-low
+      AlarmDescription: Fewer healthy tasks behind the load balancer than the service minimum, for 3 minutes.
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !ImportValue { "Fn::Sub": "${ComputeStackName}-LoadBalancerFullName" }
+        - Name: TargetGroup
+          Value: !ImportValue { "Fn::Sub": "${ComputeStackName}-TargetGroupFullName" }
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: !Ref MinTasks
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching # no data means no targets reporting
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # ---------------------------------------------------------------------------
+  # ECS service. Auto scaling aims for 60% CPU; 85% for 15 minutes means it
+  # has reached MaxTasks and still cannot keep up.
+  # ---------------------------------------------------------------------------
+  ServiceCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-service-cpu-high
+      AlarmDescription: Service CPU above 85% for 15 minutes despite auto scaling.
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: ClusterName
+          Value: !ImportValue { "Fn::Sub": "${ComputeStackName}-ClusterName" }
+        - Name: ServiceName
+          Value: !ImportValue { "Fn::Sub": "${ComputeStackName}-ServiceName" }
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  ServiceMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-service-memory-high
+      AlarmDescription: Service memory above 85% for 15 minutes (tasks risk being killed).
+      Namespace: AWS/ECS
+      MetricName: MemoryUtilization
+      Dimensions:
+        - Name: ClusterName
+          Value: !ImportValue { "Fn::Sub": "${ComputeStackName}-ClusterName" }
+        - Name: ServiceName
+          Value: !ImportValue { "Fn::Sub": "${ComputeStackName}-ServiceName" }
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # ---------------------------------------------------------------------------
+  # RDS.
+  # ---------------------------------------------------------------------------
+  DbCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-db-cpu-high
+      AlarmDescription: Database CPU above 80% for 15 minutes (t4g credits may be running out).
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !ImportValue { "Fn::Sub": "${DataStackName}-DbInstanceId" }
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  DbStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-db-storage-low
+      AlarmDescription: Database free storage below the threshold.
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !ImportValue { "Fn::Sub": "${DataStackName}-DbInstanceId" }
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref DbFreeStorageMinBytes
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  DbConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-db-connections-high
+      AlarmDescription: More database connections than the service's pools should ever open.
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !ImportValue { "Fn::Sub": "${DataStackName}-DbInstanceId" }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref DbConnectionsMax
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # ---------------------------------------------------------------------------
+  # Valkey: per node (CacheClusterId <group>-001, -002).
+  # ---------------------------------------------------------------------------
+  CacheCpuAlarmA:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-cache-001-cpu-high
+      AlarmDescription: Valkey engine CPU above 80% for 15 minutes on node 001.
+      Namespace: AWS/ElastiCache
+      MetricName: EngineCPUUtilization
+      Dimensions:
+        - Name: CacheClusterId
+          Value: !Sub
+            - ${Group}-001
+            - Group: !ImportValue { "Fn::Sub": "${DataStackName}-CacheReplicationGroupId" }
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  CacheMemoryAlarmA:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-cache-001-memory-high
+      AlarmDescription: Valkey memory above 80% on node 001 (evictions will start).
+      Namespace: AWS/ElastiCache
+      MetricName: DatabaseMemoryUsagePercentage
+      Dimensions:
+        - Name: CacheClusterId
+          Value: !Sub
+            - ${Group}-001
+            - Group: !ImportValue { "Fn::Sub": "${DataStackName}-CacheReplicationGroupId" }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  CacheCpuAlarmB:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CacheReplica
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-cache-002-cpu-high
+      AlarmDescription: Valkey engine CPU above 80% for 15 minutes on node 002.
+      Namespace: AWS/ElastiCache
+      MetricName: EngineCPUUtilization
+      Dimensions:
+        - Name: CacheClusterId
+          Value: !Sub
+            - ${Group}-002
+            - Group: !ImportValue { "Fn::Sub": "${DataStackName}-CacheReplicationGroupId" }
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  CacheMemoryAlarmB:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CacheReplica
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-cache-002-memory-high
+      AlarmDescription: Valkey memory above 80% on node 002 (evictions will start).
+      Namespace: AWS/ElastiCache
+      MetricName: DatabaseMemoryUsagePercentage
+      Dimensions:
+        - Name: CacheClusterId
+          Value: !Sub
+            - ${Group}-002
+            - Group: !ImportValue { "Fn::Sub": "${DataStackName}-CacheReplicationGroupId" }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # ---------------------------------------------------------------------------
+  # Dashboard ($3 a month): the same signals on one page, plus the cache hit
+  # rate and the alarms' current state.
+  # ---------------------------------------------------------------------------
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub aws-ha-web-platform-${EnvironmentName}
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {"type": "metric", "x": 0, "y": 0, "width": 8, "height": 6,
+               "properties": {"title": "Requests and errors", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                 "metrics": [
+                   ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${Alb}"],
+                   [".", "HTTPCode_Target_5XX_Count", ".", "."],
+                   [".", "HTTPCode_ELB_5XX_Count", ".", "."],
+                   [".", "HTTPCode_Target_4XX_Count", ".", "."]]}},
+              {"type": "metric", "x": 8, "y": 0, "width": 8, "height": 6,
+               "properties": {"title": "Response time (s)", "region": "${AWS::Region}", "period": 60,
+                 "metrics": [
+                   ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${Alb}", {"stat": "p50"}],
+                   ["...", {"stat": "p95"}],
+                   ["...", {"stat": "p99"}]]}},
+              {"type": "metric", "x": 16, "y": 0, "width": 8, "height": 6,
+               "properties": {"title": "Healthy and unhealthy tasks", "region": "${AWS::Region}", "stat": "Minimum", "period": 60,
+                 "metrics": [
+                   ["AWS/ApplicationELB", "HealthyHostCount", "LoadBalancer", "${Alb}", "TargetGroup", "${Tg}"],
+                   [".", "UnHealthyHostCount", ".", ".", ".", "."]]}},
+              {"type": "metric", "x": 0, "y": 6, "width": 8, "height": 6,
+               "properties": {"title": "Service CPU and memory (%)", "region": "${AWS::Region}", "stat": "Average", "period": 60,
+                 "metrics": [
+                   ["AWS/ECS", "CPUUtilization", "ClusterName", "${Cluster}", "ServiceName", "${Service}"],
+                   [".", "MemoryUtilization", ".", ".", ".", "."]]}},
+              {"type": "metric", "x": 8, "y": 6, "width": 8, "height": 6,
+               "properties": {"title": "Database", "region": "${AWS::Region}", "stat": "Average", "period": 60,
+                 "metrics": [
+                   ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${Db}"],
+                   [".", "DatabaseConnections", ".", ".", {"yAxis": "right"}]]}},
+              {"type": "metric", "x": 16, "y": 6, "width": 8, "height": 6,
+               "properties": {"title": "Cache hits and misses (node 001)", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                 "metrics": [
+                   ["AWS/ElastiCache", "CacheHits", "CacheClusterId", "${Cache}-001"],
+                   [".", "CacheMisses", ".", "."]]}},
+              {"type": "alarm", "x": 0, "y": 12, "width": 24, "height": 4,
+               "properties": {"title": "Alarms", "alarms": [
+                 "${AlbErrorsAlarm.Arn}", "${TargetErrorsAlarm.Arn}", "${LatencyAlarm.Arn}", "${HealthyTasksAlarm.Arn}",
+                 "${ServiceCpuAlarm.Arn}", "${ServiceMemoryAlarm.Arn}", "${DbCpuAlarm.Arn}", "${DbStorageAlarm.Arn}",
+                 "${DbConnectionsAlarm.Arn}", "${CacheCpuAlarmA.Arn}", "${CacheMemoryAlarmA.Arn}"]}}
+            ]
+          }
+        - Alb: !ImportValue { "Fn::Sub": "${ComputeStackName}-LoadBalancerFullName" }
+          Tg: !ImportValue { "Fn::Sub": "${ComputeStackName}-TargetGroupFullName" }
+          Cluster: !ImportValue { "Fn::Sub": "${ComputeStackName}-ClusterName" }
+          Service: !ImportValue { "Fn::Sub": "${ComputeStackName}-ServiceName" }
+          Db: !ImportValue { "Fn::Sub": "${DataStackName}-DbInstanceId" }
+          Cache: !ImportValue { "Fn::Sub": "${DataStackName}-CacheReplicationGroupId" }
+
+Outputs:
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
+    Export: { Name: !Sub "${AWS::StackName}-AlarmTopicArn" }
+  DashboardName:
+    Value: !Ref Dashboard

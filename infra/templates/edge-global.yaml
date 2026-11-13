@@ -29,6 +29,12 @@ Parameters:
     MaxValue: 100000
     Description: Requests one client IP may make in any 5-minute window before WAF blocks it.
 
+  WafLogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [30, 90, 180, 365]
+    Description: Retention of the WAF request log group, in days.
+
 Rules:
   UsEast1Only:
     Assertions:
@@ -50,9 +56,6 @@ Resources:
 
   # Evaluated in priority order; the first terminating match wins. Managed
   # rule groups are kept current by AWS. Each rule or group costs $1 a month.
-  # Full request logging needs a destination (an aws-waf-logs-* log group or
-  # bucket) and arrives with the security and observability stack (M2.5);
-  # sampled requests and metrics are on meanwhile.
   WebAcl:
     Type: AWS::WAFv2::WebACL
     Properties:
@@ -122,6 +125,73 @@ Resources:
       Tags:
         - { Key: Environment, Value: !Ref EnvironmentName }
         - { Key: Project, Value: aws-ha-web-platform }
+
+  # ---------------------------------------------------------------------------
+  # WAF request logs. The destination must be in the web ACL's Region
+  # (us-east-1 for CloudFront scope) and its name must start aws-waf-logs-.
+  # The logs hold client IPs and request headers, so they get their own key
+  # (the eu-west-1 logs key cannot be used from this Region).
+  # ---------------------------------------------------------------------------
+  WafLogsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub ${EnvironmentName} WAF request log encryption key
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+          - Sid: CloudWatchLogsInThisAccountAndRegion
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub aws-waf-logs-${EnvironmentName}-notes-edge
+      RetentionInDays: !Ref WafLogRetentionDays
+      KmsKeyId: !GetAtt WafLogsKey.Arn
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  # Only blocked and counted requests are logged: allowed traffic is already
+  # in the ALB and CloudFront access logs, and ingestion costs $0.57 per GB.
+  WafLogging:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      # WAF wants the log group ARN without the trailing :* that GetAtt adds.
+      LogDestinationConfigs:
+        - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WafLogGroup}
+      LoggingFilter:
+        DefaultBehavior: DROP
+        Filters:
+          - Behavior: KEEP
+            Requirement: MEETS_ANY
+            Conditions:
+              - ActionCondition: { Action: BLOCK }
+              - ActionCondition: { Action: COUNT }
 
 Outputs:
   ViewerCertificateArn:

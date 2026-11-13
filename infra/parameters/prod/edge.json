@@ -1,5 +1,6 @@
 [
   { "ParameterKey": "EnvironmentName", "ParameterValue": "prod" },
+  { "ParameterKey": "LoggingStackName", "ParameterValue": "prod-logging" },
   { "ParameterKey": "ComputeStackName", "ParameterValue": "prod-compute" },
   { "ParameterKey": "DnsStackName", "ParameterValue": "prod-dns" }
 ]

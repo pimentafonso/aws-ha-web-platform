@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 820" width="1000" height="820" role="img" aria-labelledby="title desc">
-  <title id="title">Current architecture: local stack and all AWS stacks up to the edge (in code)</title>
-  <desc id="desc">Top: a client calls the Notes API container over HTTP. The API reads and writes PostgreSQL, running migrations under an advisory lock, and uses Redis as a cache-aside layer, all in docker compose on a developer machine. Bottom: the CloudFormation network stack, written and linted but not deployed. A VPC across two Availability Zones has public, private-app and private-data subnets. Private-app subnets route to NAT in the public subnets: a NAT instance in dev, a NAT Gateway per AZ in prod. Data subnets have no default route. An S3 gateway endpoint serves ECR image layers, interface endpoints for ECR, CloudWatch Logs and Secrets Manager exist in prod, and prod sends VPC flow logs to a KMS-encrypted log group. The CloudFormation data stack, also written and linted but not deployed, puts RDS PostgreSQL 17 (single-AZ in dev, Multi-AZ standby in AZ b in prod) and ElastiCache for Valkey (one node in dev, a replica in AZ b in prod) in the data subnets. They accept connections only from the app security group, over TLS, and are encrypted with a KMS data key; the database password and Valkey token live in Secrets Manager. The compute stack, also written and linted but not deployed, adds an Application Load Balancer in the public subnets that accepts only CloudFront, and Arm64 Fargate tasks in both private-app subnets that connect to PostgreSQL with IAM authentication. Images come from an ECR repository in its own registry stack, and migrations run as a one-off ECS task. In front, written but not deployed: CloudFront with WAF (prod) sends API paths to the ALB with a secret origin header and /static/ paths to a private S3 bucket; Route 53 hosts the delegated subdomain in prod.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 900" width="1000" height="900" role="img" aria-labelledby="title desc">
+  <title id="title">Current architecture: local stack and every AWS stack (in code)</title>
+  <desc id="desc">Top: a client calls the Notes API container over HTTP. The API reads and writes PostgreSQL, running migrations under an advisory lock, and uses Redis as a cache-aside layer, all in docker compose on a developer machine. Bottom: the CloudFormation network stack, written and linted but not deployed. A VPC across two Availability Zones has public, private-app and private-data subnets. Private-app subnets route to NAT in the public subnets: a NAT instance in dev, a NAT Gateway per AZ in prod. Data subnets have no default route. An S3 gateway endpoint serves ECR image layers, interface endpoints for ECR, CloudWatch Logs and Secrets Manager exist in prod, and prod sends VPC flow logs to a KMS-encrypted log group. The CloudFormation data stack, also written and linted but not deployed, puts RDS PostgreSQL 17 (single-AZ in dev, Multi-AZ standby in AZ b in prod) and ElastiCache for Valkey (one node in dev, a replica in AZ b in prod) in the data subnets. They accept connections only from the app security group, over TLS, and are encrypted with a KMS data key; the database password and Valkey token live in Secrets Manager. The compute stack, also written and linted but not deployed, adds an Application Load Balancer in the public subnets that accepts only CloudFront, and Arm64 Fargate tasks in both private-app subnets that connect to PostgreSQL with IAM authentication. Images come from an ECR repository in its own registry stack, and migrations run as a one-off ECS task. In front, written but not deployed: CloudFront with WAF (prod) sends API paths to the ALB with a secret origin header and /static/ paths to a private S3 bucket; Route 53 hosts the delegated subdomain in prod. Below: once per account, CloudTrail and GuardDuty with emailed findings; per environment, an access-log bucket for the ALB, CloudFront and S3, and CloudWatch alarms with a dashboard.</desc>
   <style>
     .bg { fill: #ffffff; }
     .box { fill: #e2f3ef; stroke: #0b7a68; stroke-width: 1.6; }
@@ -27,7 +27,7 @@
     </marker>
   </defs>
 
-  <rect class="bg" width="1000" height="820" rx="10"/>
+  <rect class="bg" width="1000" height="900" rx="10"/>
 
   <!-- Local stack (running) -->
   <rect class="box" x="20" y="97" width="170" height="56" rx="6"/>
@@ -153,4 +153,15 @@
   <text class="el" x="130" y="682">ALB: CloudFront only (prefix list + header) · no auto public IPs</text>
   <text class="el" x="130" y="698">dev 10.10.0.0/16 · prod 10.20.0.0/16</text>
   </g>
+
+  <!-- Detection and observability -->
+  <rect class="box code" x="20" y="818" width="300" height="56" rx="6"/>
+  <text class="t" x="170" y="841" text-anchor="middle">CloudTrail · GuardDuty (account)</text>
+  <text class="s" x="170" y="859" text-anchor="middle">all Regions · findings ≥ medium emailed</text>
+  <rect class="box code" x="340" y="818" width="300" height="56" rx="6"/>
+  <text class="t" x="490" y="841" text-anchor="middle">Access-log bucket (per env)</text>
+  <text class="s" x="490" y="859" text-anchor="middle">ALB · CloudFront · S3 access logs</text>
+  <rect class="box code" x="660" y="818" width="320" height="56" rx="6"/>
+  <text class="t" x="820" y="841" text-anchor="middle">CloudWatch alarms · dashboard</text>
+  <text class="s" x="820" y="859" text-anchor="middle">ALB · ECS · RDS · Valkey → SNS email</text>
 </svg>

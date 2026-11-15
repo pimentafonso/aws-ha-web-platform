@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Validate and security-scan every CloudFormation template, and lint the
-# shell scripts.
+# Validate and security-scan every CloudFormation template, scan the GitHub
+# Actions workflows and lint the shell scripts.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,6 +13,7 @@ fi
 
 cfn-lint "${templates[@]}"
 checkov --quiet --framework cloudformation -d infra/templates
+checkov --quiet --framework github_actions -d .github/workflows
 
 # ShellCheck is preinstalled on GitHub's Ubuntu runners. Locally it is
 # optional, but CI must not skip it silently.

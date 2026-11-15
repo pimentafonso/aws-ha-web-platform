@@ -16,6 +16,7 @@ Metadata:
       - Label: { default: Service }
         Parameters:
           - ImageTag
+          - MigrationImageTag
           - ServiceEnabled
           - TaskCpu
           - TaskMemory
@@ -87,6 +88,15 @@ Parameters:
     Type: String
     AllowedPattern: ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$
     Description: Image tag in the registry (the git commit SHA).
+
+  MigrationImageTag:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$
+    Description: >-
+      Image tag for the migration task only. Empty = ImageTag. On an update
+      the deploy script first sets this to the new tag and runs the migration,
+      then moves ImageTag, so the schema changes before any new task starts.
 
   ServiceEnabled:
     Type: String
@@ -166,6 +176,7 @@ Conditions:
   FullLogging: !Equals [!Ref LoggingMode, full]
   HasCertificate: !Not [!Equals [!Ref DnsStackName, ""]]
   ServiceOn: !Equals [!Ref ServiceEnabled, "true"]
+  HasMigrationImageTag: !Not [!Equals [!Ref MigrationImageTag, ""]]
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -617,9 +628,10 @@ Resources:
       ContainerDefinitions:
         - Name: migrate
           Image: !Sub
-            - ${RepositoryUri}:${ImageTag}
+            - ${RepositoryUri}:${Tag}
             - RepositoryUri: !ImportValue
                 Fn::Sub: ${RegistryStackName}-RepositoryUri
+              Tag: !If [HasMigrationImageTag, !Ref MigrationImageTag, !Ref ImageTag]
           Essential: true
           ReadonlyRootFilesystem: true
           Command: [node, src/migrate.js]

@@ -1,0 +1,3 @@
+# Template linters, pinned. CI installs these; locally: pip install --user -r scripts/requirements-lint.txt
+cfn-lint==1.60.1
+checkov==3.4.5

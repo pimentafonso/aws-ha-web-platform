@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 900" width="1000" height="900" role="img" aria-labelledby="title desc">
-  <title id="title">Current architecture: local stack and every AWS stack (in code)</title>
-  <desc id="desc">Top: a client calls the Notes API container over HTTP. The API reads and writes PostgreSQL, running migrations under an advisory lock, and uses Redis as a cache-aside layer, all in docker compose on a developer machine. Bottom: the CloudFormation network stack, written and linted but not deployed. A VPC across two Availability Zones has public, private-app and private-data subnets. Private-app subnets route to NAT in the public subnets: a NAT instance in dev, a NAT Gateway per AZ in prod. Data subnets have no default route. An S3 gateway endpoint serves ECR image layers, interface endpoints for ECR, CloudWatch Logs and Secrets Manager exist in prod, and prod sends VPC flow logs to a KMS-encrypted log group. The CloudFormation data stack, also written and linted but not deployed, puts RDS PostgreSQL 17 (single-AZ in dev, Multi-AZ standby in AZ b in prod) and ElastiCache for Valkey (one node in dev, a replica in AZ b in prod) in the data subnets. They accept connections only from the app security group, over TLS, and are encrypted with a KMS data key; the database password and Valkey token live in Secrets Manager. The compute stack, also written and linted but not deployed, adds an Application Load Balancer in the public subnets that accepts only CloudFront, and Arm64 Fargate tasks in both private-app subnets that connect to PostgreSQL with IAM authentication. Images come from an ECR repository in its own registry stack, and migrations run as a one-off ECS task. In front, written but not deployed: CloudFront with WAF (prod) sends API paths to the ALB with a secret origin header and /static/ paths to a private S3 bucket; Route 53 hosts the delegated subdomain in prod. Below: once per account, CloudTrail and GuardDuty with emailed findings; per environment, an access-log bucket for the ALB, CloudFront and S3, and CloudWatch alarms with a dashboard.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000" width="1000" height="1000" role="img" aria-labelledby="title desc">
+  <title id="title">Current architecture: local stack, every AWS stack and the CI/CD path (in code)</title>
+  <desc id="desc">Top: a client calls the Notes API container over HTTP. The API reads and writes PostgreSQL, running migrations under an advisory lock, and uses Redis as a cache-aside layer, all in docker compose on a developer machine. Bottom: the CloudFormation network stack, written and linted but not deployed. A VPC across two Availability Zones has public, private-app and private-data subnets. Private-app subnets route to NAT in the public subnets: a NAT instance in dev, a NAT Gateway per AZ in prod. Data subnets have no default route. An S3 gateway endpoint serves ECR image layers, interface endpoints for ECR, CloudWatch Logs and Secrets Manager exist in prod, and prod sends VPC flow logs to a KMS-encrypted log group. The CloudFormation data stack, also written and linted but not deployed, puts RDS PostgreSQL 17 (single-AZ in dev, Multi-AZ standby in AZ b in prod) and ElastiCache for Valkey (one node in dev, a replica in AZ b in prod) in the data subnets. They accept connections only from the app security group, over TLS, and are encrypted with a KMS data key; the database password and Valkey token live in Secrets Manager. The compute stack, also written and linted but not deployed, adds an Application Load Balancer in the public subnets that accepts only CloudFront, and Arm64 Fargate tasks in both private-app subnets that connect to PostgreSQL with IAM authentication. Images come from an ECR repository in its own registry stack, and migrations run as a one-off ECS task. In front, written but not deployed: CloudFront with WAF (prod) sends API paths to the ALB with a secret origin header and /static/ paths to a private S3 bucket; Route 53 hosts the delegated subdomain in prod. Below: once per account, CloudTrail and GuardDuty with emailed findings; per environment, an access-log bucket for the ALB, CloudFront and S3, and CloudWatch alarms with a dashboard. Bottom row, written and linted but not run: GitHub Actions requests an OIDC token, STS exchanges it for a per-environment deploy role with no stored keys, and that role creates change sets that CloudFormation executes with a separate execution role, which may only create IAM roles inside a permissions boundary.</desc>
   <style>
     .bg { fill: #ffffff; }
     .box { fill: #e2f3ef; stroke: #0b7a68; stroke-width: 1.6; }
@@ -27,7 +27,7 @@
     </marker>
   </defs>
 
-  <rect class="bg" width="1000" height="900" rx="10"/>
+  <rect class="bg" width="1000" height="1000" rx="10"/>
 
   <!-- Local stack (running) -->
   <rect class="box" x="20" y="97" width="170" height="56" rx="6"/>
@@ -164,4 +164,20 @@
   <rect class="box code" x="660" y="818" width="320" height="56" rx="6"/>
   <text class="t" x="820" y="841" text-anchor="middle">CloudWatch alarms · dashboard</text>
   <text class="s" x="820" y="859" text-anchor="middle">ALB · ECS · RDS · Valkey → SNS email</text>
+
+  <!-- CI/CD -->
+  <text class="z" x="20" y="908">CI/CD · GITHUB OIDC, NO STORED KEYS · WRITTEN, NOT RUN</text>
+  <rect class="box code" x="20" y="920" width="250" height="56" rx="6"/>
+  <text class="t" x="145" y="943" text-anchor="middle">GitHub Actions</text>
+  <text class="s" x="145" y="961" text-anchor="middle">CI on PRs · manual deploy</text>
+  <rect class="box code" x="340" y="920" width="270" height="56" rx="6"/>
+  <text class="t" x="475" y="943" text-anchor="middle">STS · deploy role per env</text>
+  <text class="s" x="475" y="961" text-anchor="middle">trusts environment:dev|prod only</text>
+  <rect class="box code" x="680" y="920" width="300" height="56" rx="6"/>
+  <text class="t" x="830" y="943" text-anchor="middle">CloudFormation exec role</text>
+  <text class="s" x="830" y="961" text-anchor="middle">builds the stacks · bounded IAM</text>
+  <line class="e" x1="270" y1="948" x2="338" y2="948" marker-end="url(#arrow)"/>
+  <text class="el" x="304" y="940" text-anchor="middle">OIDC</text>
+  <line class="e" x1="610" y1="948" x2="678" y2="948" marker-end="url(#arrow)"/>
+  <text class="el" x="644" y="940" text-anchor="middle">PassRole</text>
 </svg>

@@ -28,6 +28,8 @@ Metadata:
           - DbMasterUsername
       - Label: { default: Valkey }
         Parameters: [CacheNodeType, CacheNodeCount, CacheSnapshotRetentionDays]
+      - Label: { default: Deploy }
+        Parameters: [PermissionsBoundaryArn]
 
 Parameters:
   EnvironmentName:
@@ -121,6 +123,16 @@ Parameters:
     AllowedValues: [0, 1, 7]
     Description: Daily cache snapshots to keep (0 = none; the cache only holds derived data).
 
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^arn:aws[a-z-]*:iam::[0-9]{12}:policy/[A-Za-z0-9+=,.@_/-]+$
+    Description: >-
+      Permissions boundary for every IAM role this stack creates. The deploy
+      script passes the cicd stack's workload boundary when it deploys through
+      the CloudFormation execution role, which may only create bounded roles.
+      Empty = no boundary (a local deploy with my own credentials).
+
 Mappings:
   # The KMS key must outlive any final database snapshot that it encrypts.
   KeyPolicyForDbPolicy:
@@ -128,6 +140,7 @@ Mappings:
     Snapshot: { Value: Retain }
 
 Conditions:
+  HasBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
   FullLogging: !Equals [!Ref LoggingMode, full]
   MultiAz: !Equals [!Ref DbMultiAz, "true"]
   PerformanceInsights: !Equals [!Ref DbPerformanceInsights, "true"]
@@ -303,6 +316,7 @@ Resources:
   DbMonitoringRole:
     Type: AWS::IAM::Role
     Properties:
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       Description: Lets RDS Enhanced Monitoring publish OS metrics to CloudWatch Logs
       AssumeRolePolicyDocument:
         Version: "2012-10-17"

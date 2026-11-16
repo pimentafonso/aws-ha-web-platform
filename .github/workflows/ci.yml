@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its previous run; runs on main finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  app:
+    name: App lint and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Same images as compose.yaml, on the ports the tests default to.
+    services:
+      postgres:
+        image: postgres:17.11-alpine
+        env:
+          POSTGRES_DB: notes
+          POSTGRES_USER: notes
+          POSTGRES_PASSWORD: notes-local-only
+        ports: ["5442:5432"]
+        options: >-
+          --health-cmd "pg_isready -U notes -d notes"
+          --health-interval 2s --health-timeout 5s --health-retries 15
+      redis:
+        image: redis:7.4.12-alpine
+        ports: ["6389:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 5s --health-retries 15
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.23.5 # same as the Dockerfile
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  templates:
+    name: Templates and scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: scripts/requirements-lint.txt
+      - run: pip install -r scripts/requirements-lint.txt
+      - run: bash scripts/lint.sh # cfn-lint, Checkov, ShellCheck
+
+  image:
+    name: Image build (arm64)
+    # Native arm64 runner: the image runs on Graviton, and building it here
+    # avoids QEMU emulation.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build without pushing
+        run: >-
+          docker buildx build --platform linux/arm64 --provenance=false --sbom=false
+          --tag "notes-api:${GITHUB_SHA}" app

@@ -1,0 +1,58 @@
+name: Deploy
+
+# Manual only for now. Whether merges to main deploy dev automatically is
+# decided once I have deployed by hand and measured it.
+on:
+  # checkov:skip=CKV_GHA_7: The input only picks the target environment. The image is always built from the commit being deployed and tagged with its SHA.
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        type: choice
+        options: [dev, prod]
+        default: dev
+        required: true
+
+permissions:
+  contents: read
+  id-token: write # request the OIDC token that AWS exchanges for the deploy role
+
+# Never two deploys of one environment at once, and never cancel one halfway.
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment }}
+    # Deploy only what is on main, even if an environment's deployment
+    # branch rule is missing or loosened.
+    if: github.ref == 'refs/heads/main'
+    # The OIDC token's subject is repo:<owner>/<repo>:environment:<env>,
+    # the only subject each deploy role trusts.
+    environment: ${{ inputs.environment }}
+    # arm64 runner: the image is built natively for Graviton.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/aws-ha-web-platform-${{ inputs.environment }}-github-deploy
+          role-session-name: deploy-${{ inputs.environment }}-${{ github.run_id }}
+          role-duration-seconds: 7200
+          aws-region: eu-west-1
+          mask-aws-account-id: true
+      - name: Deploy
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          USE_EXEC_ROLE: "true"
+          IMAGE_TAG: ${{ github.sha }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          DOMAIN_NAME: ${{ secrets.DOMAIN_NAME }}
+        run: |
+          aws --version
+          bash scripts/deploy.sh "$DEPLOY_ENV"

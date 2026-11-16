@@ -52,7 +52,7 @@ Behaviours that matter for the platform:
 
 ![Current architecture: the Notes API, PostgreSQL and Redis running locally in docker compose](docs/images/architecture-current.svg)
 
-Nothing is deployed to AWS yet. PostgreSQL and Redis stand in locally for RDS and ElastiCache. All the stacks in [`infra/templates/`](infra/templates/) are written and pass lint, but none has been deployed. This diagram is updated as each stack lands.
+Nothing is deployed to AWS yet. PostgreSQL and Redis stand in locally for RDS and ElastiCache. All the stacks in [`infra/templates/`](infra/templates/), the deploy and teardown scripts and the CI workflow are written and pass lint, but nothing has been deployed. This diagram is updated as each stack lands.
 
 ### Target
 
@@ -180,6 +180,26 @@ At list prices, this adds about **$4.10 a month in dev** and **$5.30 in prod**, 
   Each alarm notifies on both trigger and recovery, by email through an SNS topic. That topic uses SNS's default encryption rather than a customer-managed key. CloudWatch alarms cannot publish to a topic encrypted with the AWS-managed SNS key, and alarm messages hold only alarm names and numbers.
 - **One dashboard per environment** ($3 a month) shows the same signals on one page: requests and errors, p50/p95/p99 latency, healthy tasks, service CPU and memory, database CPU and connections, cache hits and misses, and every alarm's state.
 
+### CI/CD and deploy access (`cicd.yaml`, `.github/workflows/`, `scripts/`)
+
+- **No AWS keys in GitHub.** The deploy workflow asks GitHub for an OIDC token, and STS exchanges it for a role session of at most two hours (a first prod deploy waits on RDS Multi-AZ and CloudFront). Each environment's deploy role trusts exactly one subject, `repo:pimentafonso/aws-ha-web-platform:environment:<env>`, with the audience `sts.amazonaws.com`. A fork, another repository, or a job outside that GitHub environment gets nothing. The subjects are stack parameters, so they could be narrowed further (for example to a single branch) without editing the template.
+- **One OIDC provider per account, so creating it is optional.** AWS allows one `token.actions.githubusercontent.com` provider per account. `CreateOidcProvider=false` with `ExistingOidcProviderArn` reuses one that already exists. AWS validates GitHub's tokens against its own trusted CAs, so no certificate thumbprint is pinned.
+- **Two roles per environment.** The GitHub deploy role can do very little by itself:
+  - create and execute change sets on `<env>-*` stacks, and only together with that environment's CloudFormation execution role (a `cloudformation:RoleArn` condition);
+  - push to one ECR repository;
+  - run one task definition family in one cluster, and pass only that stack's roles to ECS;
+  - write under `static/` in one bucket, and invalidate CloudFront;
+  - read stack outputs, the CloudFront prefix list and the public AMI parameter.
+
+  It cannot delete stacks or read secrets. Teardown is a deliberate local action. The execution role holds the broad permissions that creating VPCs, databases, load balancers and keys needs. Only CloudFormation can assume it, and only for that environment's stacks (`aws:SourceArn`).
+- **What the split does not do.** Anyone who can get a template onto `main` and run the deploy workflow can make CloudFormation create almost anything those services allow. Running the migration task is similar: `ecs run-task` accepts command overrides, and that task holds the database master secret. The split keeps the CI token away from the AWS APIs and puts every change in a stack's history, but it is not a sandbox. I bound it in three ways:
+  - **IAM is fenced.** The execution role can create roles only if they are named `<env>-*` and carry the workload permissions boundary from `cicd.yaml`. It cannot edit or remove that boundary. Every role the stacks create (task, execution, NAT instance, flow logs, RDS monitoring) takes it as a parameter. So no template can create an administrator role: the most any workload role can do is pull images, write logs, read this project's secrets, connect to RDS with IAM auth and talk to Session Manager. The boundary applies when deploying through the execution role, as CI does. My own local deploys use my administrator credentials and skip it.
+  - **Explicit denies.** The execution role is denied the account's audit bucket, CloudTrail and GuardDuty, and anything tagged with the other environment.
+  - **Review on `main`.** This is the control that matters most. The repository is public, so GitHub's branch protection and environment rules are available; their set-up is in [CI/CD](#cicd).
+- **Same script locally and in CI.** The workflow only checks out the commit, assumes the role and runs `scripts/deploy.sh`, so a deploy from my laptop and one from Actions take the same path.
+- **Schema before code.** On every deploy the migration task moves to the new image first and runs (`MigrationImageTag`). Only then does the service roll to it. Migrations therefore have to stay compatible with the release that is still running, which suits additive changes (new tables, nullable columns).
+- **Cost.** IAM roles, the OIDC provider and the managed policy are free. GitHub-hosted standard runners, including the arm64 one, are free for public repositories (GitHub's pricing page, November 2026). A private repository on GitHub Free gets $12 a month of Actions usage, at list prices of $0.006 a minute for Linux x64 and $0.005 for Linux arm64.
+
 ### Planned
 
 - **CloudFormation over CDK/Terraform:** _TBD_
@@ -195,7 +215,7 @@ Detail in [SECURITY.md](SECURITY.md). In short:
   - The cache token and the origin header are generated by Secrets Manager.
   - Nothing secret is in a template or in this repository.
 - **Encryption in transit and at rest.** TLS from viewer to CloudFront to the ALB in prod, and to PostgreSQL and Valkey. Customer-managed KMS keys for the data tier, logs and audit trail.
-- **Least-privilege IAM.** Each role allows one job: pull an image, read one secret, or connect as one database user.
+- **Least-privilege IAM.** Each role allows one job: pull an image, read one secret, or connect as one database user. CI deploys with short-lived OIDC sessions and no stored keys. Everything else goes through a CloudFormation execution role, which can only create roles inside a permissions boundary.
 - **Detection.** CloudTrail in every Region with log file validation, GuardDuty with emailed findings, WAF logs of blocked requests, and access logs for the ALB, CloudFront and S3.
 
 ## Observability
@@ -228,9 +248,9 @@ app/                    Node.js/Express API and Dockerfile
 static/                 Static files served from S3 under /static/
 infra/templates/        CloudFormation templates, one per stack
 infra/parameters/       Parameter files per environment (dev, prod)
-scripts/                deploy, destroy and lint scripts used by make and CI
+scripts/                deploy, destroy and lint scripts (and their shared lib.sh), used by make and CI
 docs/                   Diagrams, screenshots, runbooks
-.github/workflows/      CI/CD pipelines
+.github/workflows/      CI (lint, tests, image build) and the manual deploy workflow
 ```
 
 ## Run locally
@@ -245,21 +265,75 @@ docker compose --profile app up --build   # API on http://localhost:3000
 
 ## Deploy and teardown
 
-Once per account: security (eu-west-1). Then, per environment: network → logging → data → registry → push the image (tagged with the commit SHA) → (prod: dns, then delegate the subdomain at the parent's DNS provider) → compute → run the migration task → service up → (prod: edge-global in us-east-1) → edge → sync `static/` to the bucket → observability. On the first deploy, compute is created with `ServiceEnabled=false`, and the migration task creates the `notes_app` database user before the service starts any tasks. Prod's certificates validate only once the delegation is live. Stacks that use the `AWS::LanguageExtensions` transform (data) need `CAPABILITY_AUTO_EXPAND`, and stacks that create IAM roles (network, data, compute) need `CAPABILITY_IAM`. The alert email address for security and observability is supplied at deploy time; AWS emails a confirmation link before it sends anything else. `CloudFrontPrefixListId`, `ImageTag`, the domain name, and the edge-global outputs passed to edge (certificate and web ACL ARNs, which contain the account id) are supplied at deploy time, not stored in the parameter files.
-
-The scripts are still _TBD_. The intended interface:
+Nothing has been deployed yet. Deploying needs the AWS CLI v2 and bash 4 or later (Git Bash works on Windows). It also needs Docker with buildx, unless the image is already in ECR.
 
 ```sh
-make lint                 # cfn-lint + Checkov on all templates
-make deploy ENV=dev       # deploy every stack in order
-make destroy ENV=dev      # delete every stack in reverse order
+bash scripts/lint.sh               # cfn-lint, Checkov (templates and workflows), ShellCheck
+bash scripts/deploy.sh account     # once per account: the security and cicd stacks
+bash scripts/deploy.sh dev         # every dev stack, in order
+bash scripts/destroy.sh dev        # every dev stack, in reverse order
 ```
 
-On Windows without `make`, use the scripts directly, e.g. `bash scripts/deploy.sh dev`.
+`make lint`, `make deploy ENV=dev` and `make destroy ENV=dev` do the same where `make` is installed; the Makefile only calls these scripts.
+
+Private values come from the environment, never from files in the repository:
+
+| Variable | Used by | Purpose |
+|---|---|---|
+| `ALERT_EMAIL` | `deploy.sh` (all targets) | Where alarms and GuardDuty findings are emailed. AWS sends a confirmation link first. |
+| `DOMAIN_NAME` | `deploy.sh prod` | The delegated subdomain the platform serves. |
+| `IMAGE_TAG` | `deploy.sh dev` and `prod` | Image to deploy. Default: the current commit SHA. |
+| `USE_EXEC_ROLE=true` | `deploy.sh dev` and `prod` | Deploy through the environment's CloudFormation execution role, with the workload boundary on every role. CI sets it. |
+| `SKIP_DELEGATION_CHECK=true` | `deploy.sh prod` | Carry on before public DNS shows the subdomain delegated to Route 53. |
+| `ALLOW_DIRTY=true` | `deploy.sh dev` and `prod` | Build an image from a working tree with uncommitted changes. |
+| `CONFIRM_PROD=yes` | `destroy.sh prod` | Required to destroy prod. |
+| `PURGE_RETAINED=yes` | `destroy.sh prod` | Also delete the final database snapshot, and schedule the retained data key for deletion. |
+
+**Deploy order.** `deploy.sh <env>` runs `aws cloudformation deploy` for each stack. It uses the stack's parameter file plus deploy-time values, and passes the capabilities each stack needs (`CAPABILITY_IAM` for network, data and compute; also `CAPABILITY_AUTO_EXPAND` for data, which uses the `AWS::LanguageExtensions` transform). Re-running it changes only what differs. The order:
+
+1. network, logging, data and registry.
+2. The arm64 image is built and pushed, tagged with the commit SHA. Tags are immutable, so an image already in ECR is never rebuilt.
+3. Prod only: the dns stack. The script then stops until public DNS shows the subdomain delegated to the new hosted zone, printing the four name servers to add as NS records at the parent domain's DNS provider. Until the delegation is live, ACM cannot validate the certificates.
+4. compute. The script looks up the CloudFront origin-facing prefix list itself.
+   - First deploy: the service is created with no tasks (`ServiceEnabled=false`). The migration task then runs in the private app subnets with the app security group, applies the schema and creates the `notes_app` database user. Only then is the service started.
+   - Later deploys: the migration task moves to the new image and runs first, then the service rolls to it.
+
+   Either way, the script waits for the migration task and stops the deploy, printing its log, unless it exits with 0.
+5. Prod only: edge-global, in us-east-1. Exports cannot cross Regions, so the hosted zone id is passed in, and the certificate and web ACL ARNs are read back and passed to edge. They contain the account id, so they are never stored in the repository.
+6. edge. Then `static/` is synced to the bucket and `/static/*` is invalidated.
+7. observability.
+
+A stack whose first creation failed (`ROLLBACK_COMPLETE`) has to be deleted before it can be deployed again. The script stops and says so.
+
+**Teardown.** `destroy.sh <env>` deletes in reverse order and skips stacks that are not there, so an interrupted teardown can simply be run again. It runs with my own credentials: the GitHub deploy roles cannot delete stacks.
+
+- Prod's ALB and RDS deletion protection is turned off by updating those stacks' parameters, not by calling the services directly, so the stacks never drift from what they manage.
+- The static bucket and the access-log bucket are versioned, so every object version and delete marker is removed first. The log bucket is retried, because a late CloudFront or ALB log can land after it was emptied. ECR images go with the repository (`EmptyOnDelete`).
+- ACM's DNS validation records are removed from the hosted zone, because Route 53 will not delete a zone that still has records.
+- Prod's database gets a final snapshot (`DeletionPolicy: Snapshot`), and the KMS key that encrypts it is retained, so the snapshot stays restorable. The script reports both and the commands to remove them, or removes them with `PURGE_RETAINED=yes`: it deletes the snapshot and schedules the key for deletion in 7 days. Both are billed until then.
+- The account-level stacks, security and cicd, are never deleted by `destroy.sh`. The CloudTrail audit bucket and its key are retained by design.
 
 ## CI/CD
 
-_TBD: GitHub Actions with OIDC role assumption, no stored access keys._
+| Workflow | Runs on | What it does |
+|---|---|---|
+| [`ci.yml`](.github/workflows/ci.yml) | Every pull request and push to `main` | Three parallel jobs. **App:** `npm ci`, ESLint and the tests, against PostgreSQL 17.11 and Redis 7.4.12 service containers. **Templates and scripts:** `scripts/lint.sh` with pinned cfn-lint and Checkov (templates and workflows) and ShellCheck. **Image:** the arm64 image built on a native arm64 runner, not pushed. |
+| [`deploy.yml`](.github/workflows/deploy.yml) | Manual (`workflow_dispatch`), environment `dev` or `prod`, from `main` only | Assumes that environment's deploy role through OIDC and runs `scripts/deploy.sh` with `USE_EXEC_ROLE=true` and the commit SHA as the image tag. |
+
+- Both workflows have read-only repository access (`contents: read`); only the deploy job can also request an OIDC token (`id-token: write`). Checkout does not keep the token on disk.
+- Every action is pinned to a full commit SHA, with its version in a comment.
+- A new push to a pull request cancels that pull request's previous CI run. Deploys of the same environment queue rather than overlap, and never cancel one another.
+- Merges to `main` do not deploy anything yet. I will decide whether `main` deploys dev automatically once I have run and timed the deploys by hand.
+
+One-off set-up, to do before the first CI deploy (none of it exists yet):
+
+1. `bash scripts/deploy.sh account` with my own credentials. It creates the OIDC provider, the deploy and execution roles, and the boundary.
+2. In the repository settings:
+   - the environments `dev` and `prod`, each allowed to deploy only from `main`, with `prod` requiring my approval;
+   - a repository variable `AWS_ACCOUNT_ID`;
+   - a repository secret `ALERT_EMAIL`;
+   - a `prod` environment secret `DOMAIN_NAME`.
+3. Branch protection on `main`: changes only through pull requests, with CI required to pass.
 
 ## What I'd do next
 

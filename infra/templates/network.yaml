@@ -16,6 +16,8 @@ Metadata:
         Parameters: [NatMode, NatCount, NatInstanceType, NatInstanceAmiId]
       - Label: { default: Endpoints and logging }
         Parameters: [EnableInterfaceEndpoints, LoggingMode, FlowLogRetentionDays]
+      - Label: { default: Deploy }
+        Parameters: [PermissionsBoundaryArn]
 
 Parameters:
   EnvironmentName:
@@ -81,7 +83,18 @@ Parameters:
     AllowedValues: [7, 14, 30, 60, 90, 180, 365]
     Description: Retention of the VPC flow log group, in days (full logging only).
 
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^arn:aws[a-z-]*:iam::[0-9]{12}:policy/[A-Za-z0-9+=,.@_/-]+$
+    Description: >-
+      Permissions boundary for every IAM role this stack creates. The deploy
+      script passes the cicd stack's workload boundary when it deploys through
+      the CloudFormation execution role, which may only create bounded roles.
+      Empty = no boundary (a local deploy with my own credentials).
+
 Conditions:
+  HasBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
   TwoNats: !Equals [!Ref NatCount, 2]
   UseNatGateway: !Equals [!Ref NatMode, gateway]
   UseNatInstance: !Equals [!Ref NatMode, instance]
@@ -313,6 +326,7 @@ Resources:
     Type: AWS::IAM::Role
     Condition: UseNatInstance
     Properties:
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       Description: NAT instance role, SSM Session Manager access only
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -685,6 +699,7 @@ Resources:
     Type: AWS::IAM::Role
     Condition: FullLogging
     Properties:
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       Description: Lets VPC Flow Logs write to the flow log group
       AssumeRolePolicyDocument:
         Version: "2012-10-17"

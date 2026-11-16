@@ -16,6 +16,7 @@ Metadata:
       - Label: { default: Service }
         Parameters:
           - ImageTag
+          - MigrationImageTag
           - ServiceEnabled
           - TaskCpu
           - TaskMemory
@@ -25,6 +26,8 @@ Metadata:
           - DbAppUser
           - ContainerInsights
           - LogRetentionDays
+      - Label: { default: Deploy }
+        Parameters: [PermissionsBoundaryArn]
 
 Parameters:
   EnvironmentName:
@@ -86,6 +89,15 @@ Parameters:
     AllowedPattern: ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$
     Description: Image tag in the registry (the git commit SHA).
 
+  MigrationImageTag:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$
+    Description: >-
+      Image tag for the migration task only. Empty = ImageTag. On an update
+      the deploy script first sets this to the new tag and runs the migration,
+      then moves ImageTag, so the schema changes before any new task starts.
+
   ServiceEnabled:
     Type: String
     AllowedValues: ["true", "false"]
@@ -140,6 +152,16 @@ Parameters:
     AllowedValues: [7, 14, 30, 60, 90, 180, 365]
     Description: Retention of the application log group, in days.
 
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^arn:aws[a-z-]*:iam::[0-9]{12}:policy/[A-Za-z0-9+=,.@_/-]+$
+    Description: >-
+      Permissions boundary for every IAM role this stack creates. The deploy
+      script passes the cicd stack's workload boundary when it deploys through
+      the CloudFormation execution role, which may only create bounded roles.
+      Empty = no boundary (a local deploy with my own credentials).
+
 Rules:
   # Plain HTTP between CloudFront and the ALB is only for dev, which has no
   # domain. Prod refuses to deploy without one, and so without HTTPS.
@@ -150,9 +172,11 @@ Rules:
         AssertDescription: prod needs DnsStackName (origin certificate, HTTPS from CloudFront to the ALB).
 
 Conditions:
+  HasBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
   FullLogging: !Equals [!Ref LoggingMode, full]
   HasCertificate: !Not [!Equals [!Ref DnsStackName, ""]]
   ServiceOn: !Equals [!Ref ServiceEnabled, "true"]
+  HasMigrationImageTag: !Not [!Equals [!Ref MigrationImageTag, ""]]
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -377,6 +401,7 @@ Resources:
   ServiceExecutionRole:
     Type: AWS::IAM::Role
     Properties:
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       Description: ECS pulls the image, writes logs and injects the Valkey token for the service
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -425,6 +450,7 @@ Resources:
   MigrationExecutionRole:
     Type: AWS::IAM::Role
     Properties:
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       Description: ECS pulls the image, writes logs and injects the database master secret for the migration task
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -473,6 +499,7 @@ Resources:
   ServiceTaskRole:
     Type: AWS::IAM::Role
     Properties:
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       Description: Credentials inside the API container; may only connect to the database as the app user
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -601,9 +628,10 @@ Resources:
       ContainerDefinitions:
         - Name: migrate
           Image: !Sub
-            - ${RepositoryUri}:${ImageTag}
+            - ${RepositoryUri}:${Tag}
             - RepositoryUri: !ImportValue
                 Fn::Sub: ${RegistryStackName}-RepositoryUri
+              Tag: !If [HasMigrationImageTag, !Ref MigrationImageTag, !Ref ImageTag]
           Essential: true
           ReadonlyRootFilesystem: true
           Command: [node, src/migrate.js]

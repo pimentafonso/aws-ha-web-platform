@@ -1,0 +1,710 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  aws-ha-web-platform cicd stack, deployed once per account (eu-west-1). The
+  GitHub Actions OIDC identity provider (optional, there can only be one per
+  account), and per environment a GitHub deploy role and a CloudFormation
+  execution role, plus the permissions boundary every workload role must carry.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: GitHub }
+        Parameters: [GitHubRepository, DevSubject, ProdSubject]
+      - Label: { default: OIDC provider }
+        Parameters: [CreateOidcProvider, ExistingOidcProviderArn]
+
+Parameters:
+  GitHubRepository:
+    Type: String
+    Default: pimentafonso/aws-ha-web-platform
+    AllowedPattern: ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$
+    Description: owner/repository whose workflows may assume the deploy roles.
+
+  DevSubject:
+    Type: String
+    Default: environment:dev
+    AllowedPattern: ^(environment:[A-Za-z0-9_.-]+|ref:refs/heads/[A-Za-z0-9_./-]+)$
+    Description: >-
+      Part of the OIDC sub claim after repo:<owner>/<repo>: that may assume the
+      dev deploy role. environment:dev = only jobs running in the GitHub
+      environment dev.
+
+  ProdSubject:
+    Type: String
+    Default: environment:prod
+    AllowedPattern: ^(environment:[A-Za-z0-9_.-]+|ref:refs/heads/[A-Za-z0-9_./-]+)$
+    Description: Same as DevSubject, for the prod deploy role.
+
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >-
+      false = the account already has the token.actions.githubusercontent.com
+      provider; pass its ARN in ExistingOidcProviderArn.
+
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ""
+    AllowedPattern: ^$|^arn:aws[a-z-]*:iam::[0-9]{12}:oidc-provider/token\.actions\.githubusercontent\.com$
+    Description: ARN of the existing GitHub OIDC provider, when CreateOidcProvider is false.
+
+Rules:
+  ProviderArnWhenNotCreating:
+    RuleCondition: !Equals [!Ref CreateOidcProvider, "false"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref ExistingOidcProviderArn, ""]]
+        AssertDescription: Pass ExistingOidcProviderArn when CreateOidcProvider is false.
+
+Conditions:
+  CreateProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # GitHub OIDC provider. AWS validates GitHub's tokens against its own trusted
+  # CA list, so no certificate thumbprint is pinned here.
+  # ---------------------------------------------------------------------------
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      Tags:
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  # ---------------------------------------------------------------------------
+  # Permissions boundary for every role the stacks create (NAT instance, flow
+  # logs, RDS monitoring, ECS execution and task roles). The execution roles
+  # below can only create roles that carry it, so whatever a template asks
+  # for, no workload role can do more than this: pull images, write logs,
+  # read this project's secrets, connect to RDS with IAM auth, and talk to
+  # Session Manager. It is a ceiling, not a grant.
+  # ---------------------------------------------------------------------------
+  WorkloadBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: >-
+              A permissions boundary grants nothing on its own; each role's
+              policy names its resources. Session Manager's agent actions
+              (ssm:UpdateInstanceInformation and friends) do not support
+              resource-level permissions, so the ceiling has to use "*".
+    Properties:
+      ManagedPolicyName: aws-ha-web-platform-workload-boundary
+      Description: Ceiling for every IAM role created by the aws-ha-web-platform stacks
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PullImages
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchCheckLayerAvailability
+            Resource: "*"
+          - Sid: WriteLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:PutRetentionPolicy
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+              - logs:GetLogEvents
+            Resource: !Sub arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*
+          - Sid: ProjectSecrets
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource:
+              - !Sub arn:${AWS::Partition}:secretsmanager:*:${AWS::AccountId}:secret:aws-ha-web-platform/*
+              - !Sub arn:${AWS::Partition}:secretsmanager:*:${AWS::AccountId}:secret:rds!*
+          - Sid: DecryptThroughSecretsManager
+            Effect: Allow
+            Action: kms:Decrypt
+            Resource: !Sub arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*
+            Condition:
+              StringLike:
+                kms:ViaService: secretsmanager.*.amazonaws.com
+          - Sid: DatabaseIamAuth
+            Effect: Allow
+            Action: rds-db:connect
+            Resource: !Sub arn:${AWS::Partition}:rds-db:*:${AWS::AccountId}:dbuser:*/*
+          - Sid: SessionManagerAgent
+            Effect: Allow
+            Action:
+              - ssm:UpdateInstanceInformation
+              - ssm:ListAssociations
+              - ssm:ListInstanceAssociations
+              - ssm:DescribeAssociation
+              - ssm:DescribeDocument
+              - ssm:GetDocument
+              - ssm:GetManifest
+              - ssm:GetDeployablePatchSnapshotForInstance
+              - ssm:PutInventory
+              - ssm:PutComplianceItems
+              - ssm:PutConfigurePackageResult
+              - ssm:UpdateAssociationStatus
+              - ssm:UpdateInstanceAssociationStatus
+              - ssmmessages:CreateControlChannel
+              - ssmmessages:CreateDataChannel
+              - ssmmessages:OpenControlChannel
+              - ssmmessages:OpenDataChannel
+              - ec2messages:AcknowledgeMessage
+              - ec2messages:DeleteMessage
+              - ec2messages:FailMessage
+              - ec2messages:GetEndpoint
+              - ec2messages:GetMessages
+              - ec2messages:SendReply
+            Resource: "*"
+
+  # ---------------------------------------------------------------------------
+  # dev. CloudFormation execution role: CloudFormation assumes it to create
+  # the stacks' resources, so it holds the broad permissions. Only
+  # CloudFormation can assume it, only for dev-* stacks in this account.
+  # ---------------------------------------------------------------------------
+  DevCfnExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-ha-web-platform-dev-cfn-exec
+      Description: CloudFormation creates dev-* stack resources with this role
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/dev-*/*
+      Policies:
+        - PolicyName: provision-dev
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PlatformServices
+                Effect: Allow
+                Action:
+                  - acm:*
+                  - application-autoscaling:*
+                  - cloudfront:*
+                  - cloudwatch:*
+                  - ec2:*
+                  - ecr:*
+                  - ecs:*
+                  - elasticache:*
+                  - elasticloadbalancing:*
+                  - kms:*
+                  - logs:*
+                  - rds:*
+                  - route53:*
+                  - s3:*
+                  - secretsmanager:*
+                  - sns:*
+                  - ssm:GetParameters
+                  - wafv2:*
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: [eu-west-1, us-east-1]
+              - Sid: CreateBoundedRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:PutRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:PutRolePermissionsBoundary
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/dev-*
+                Condition:
+                  StringEquals:
+                    iam:PermissionsBoundary: !Ref WorkloadBoundary
+              - Sid: ManageOwnRoles
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRoleTags
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateRole
+                  - iam:UpdateRoleDescription
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:DeleteRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/dev-*
+              - Sid: PassOwnRolesToServices
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/dev-*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - ec2.amazonaws.com
+                      - ecs-tasks.amazonaws.com
+                      - monitoring.rds.amazonaws.com
+                      - vpc-flow-logs.amazonaws.com
+              - Sid: OwnInstanceProfiles
+                Effect: Allow
+                Action:
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:GetInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:TagInstanceProfile
+                  - iam:UntagInstanceProfile
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/dev-*
+              - Sid: ServiceLinkedRoles
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - ecs.amazonaws.com
+                      - ecs.application-autoscaling.amazonaws.com
+                      - elasticache.amazonaws.com
+                      - elasticloadbalancing.amazonaws.com
+                      - rds.amazonaws.com
+              - Sid: KeepTheBoundary
+                Effect: Deny
+                Action:
+                  - iam:DeleteRolePermissionsBoundary
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicy
+                  - iam:DeletePolicyVersion
+                  - iam:SetDefaultPolicyVersion
+                Resource: "*"
+              - Sid: NotTheAuditTrail
+                Effect: Deny
+                Action: [s3:*, cloudtrail:*, guardduty:*]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::security-*
+                  - !Sub arn:${AWS::Partition}:s3:::security-*/*
+                  - !Sub arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*
+                  - !Sub arn:${AWS::Partition}:guardduty:*:${AWS::AccountId}:detector/*
+              - Sid: NotTheOtherEnvironment
+                Effect: Deny
+                Action: "*"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Environment: prod
+      Tags:
+        - { Key: Environment, Value: dev }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  # GitHub deploy role: what a dev deploy job may do directly. It drives
+  # CloudFormation (always through the execution role above), pushes the
+  # image, runs the migration task, syncs static files and reads outputs.
+  # It cannot create or change anything else itself.
+  DevGitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-ha-web-platform-dev-github-deploy
+      Description: GitHub Actions deploys dev with this role (OIDC, no stored keys)
+      MaxSessionDuration: 7200 # a first deploy waits on RDS and CloudFront
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepository}:${DevSubject}
+      Policies:
+        - PolicyName: deploy-dev
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StacksThroughExecutionRole
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/dev-*/*
+                Condition:
+                  StringEquals:
+                    cloudformation:RoleArn: !GetAtt DevCfnExecutionRole.Arn
+                    aws:RequestedRegion: [eu-west-1, us-east-1]
+              - Sid: Stacks
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplateSummary
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/dev-*/*
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: [eu-west-1, us-east-1]
+              - Sid: LanguageExtensionsTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:aws:transform/LanguageExtensions
+              - Sid: TemplateChecks
+                Effect: Allow
+                Action: [cloudformation:ValidateTemplate, cloudformation:GetTemplateSummary]
+                Resource: "*"
+              - Sid: PassExecutionRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt DevCfnExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: RegistryLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*" # this action does not support resource-level permissions
+              - Sid: PushImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !Sub arn:${AWS::Partition}:ecr:eu-west-1:${AWS::AccountId}:repository/aws-ha-web-platform/dev/notes-api
+              - Sid: RunMigrationTask
+                Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub arn:${AWS::Partition}:ecs:eu-west-1:${AWS::AccountId}:task-definition/dev-notes-migrate:*
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !Sub arn:${AWS::Partition}:ecs:eu-west-1:${AWS::AccountId}:cluster/dev-notes
+              - Sid: WatchTasks
+                Effect: Allow
+                Action: [ecs:DescribeTasks, ecs:DescribeServices]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ecs:eu-west-1:${AWS::AccountId}:task/dev-notes/*
+                  - !Sub arn:${AWS::Partition}:ecs:eu-west-1:${AWS::AccountId}:service/dev-notes/*
+              - Sid: PassMigrationRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/dev-compute-*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Sid: ReadMigrationLogs
+                Effect: Allow
+                Action: logs:GetLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:eu-west-1:${AWS::AccountId}:log-group:/aws-ha-web-platform/dev/notes-api:log-stream:migrate/*
+              - Sid: ListStaticBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::dev-edge-staticbucket-*
+              - Sid: SyncStaticFiles
+                Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject]
+                Resource: !Sub arn:${AWS::Partition}:s3:::dev-edge-staticbucket-*/static/*
+              - Sid: InvalidateStaticFiles
+                Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/*
+              - Sid: Lookups
+                Effect: Allow
+                Action: ec2:DescribeManagedPrefixLists
+                Resource: "*" # describe actions do not support resource-level permissions
+              - Sid: PublicAmiParameter
+                Effect: Allow
+                Action: ssm:GetParameters
+                Resource: !Sub arn:${AWS::Partition}:ssm:*::parameter/aws/service/ami-amazon-linux-latest/*
+      Tags:
+        - { Key: Environment, Value: dev }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  # ---------------------------------------------------------------------------
+  # prod. Same shape as dev, scoped to prod-* names.
+  # ---------------------------------------------------------------------------
+  ProdCfnExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-ha-web-platform-prod-cfn-exec
+      Description: CloudFormation creates prod-* stack resources with this role
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/prod-*/*
+      Policies:
+        - PolicyName: provision-prod
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PlatformServices
+                Effect: Allow
+                Action:
+                  - acm:*
+                  - application-autoscaling:*
+                  - cloudfront:*
+                  - cloudwatch:*
+                  - ec2:*
+                  - ecr:*
+                  - ecs:*
+                  - elasticache:*
+                  - elasticloadbalancing:*
+                  - kms:*
+                  - logs:*
+                  - rds:*
+                  - route53:*
+                  - s3:*
+                  - secretsmanager:*
+                  - sns:*
+                  - ssm:GetParameters
+                  - wafv2:*
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: [eu-west-1, us-east-1]
+              - Sid: CreateBoundedRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:PutRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:PutRolePermissionsBoundary
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/prod-*
+                Condition:
+                  StringEquals:
+                    iam:PermissionsBoundary: !Ref WorkloadBoundary
+              - Sid: ManageOwnRoles
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRoleTags
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateRole
+                  - iam:UpdateRoleDescription
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:DeleteRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/prod-*
+              - Sid: PassOwnRolesToServices
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/prod-*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - ec2.amazonaws.com
+                      - ecs-tasks.amazonaws.com
+                      - monitoring.rds.amazonaws.com
+                      - vpc-flow-logs.amazonaws.com
+              - Sid: OwnInstanceProfiles
+                Effect: Allow
+                Action:
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:GetInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:TagInstanceProfile
+                  - iam:UntagInstanceProfile
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/prod-*
+              - Sid: ServiceLinkedRoles
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - ecs.amazonaws.com
+                      - ecs.application-autoscaling.amazonaws.com
+                      - elasticache.amazonaws.com
+                      - elasticloadbalancing.amazonaws.com
+                      - rds.amazonaws.com
+              - Sid: KeepTheBoundary
+                Effect: Deny
+                Action:
+                  - iam:DeleteRolePermissionsBoundary
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicy
+                  - iam:DeletePolicyVersion
+                  - iam:SetDefaultPolicyVersion
+                Resource: "*"
+              - Sid: NotTheAuditTrail
+                Effect: Deny
+                Action: [s3:*, cloudtrail:*, guardduty:*]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::security-*
+                  - !Sub arn:${AWS::Partition}:s3:::security-*/*
+                  - !Sub arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*
+                  - !Sub arn:${AWS::Partition}:guardduty:*:${AWS::AccountId}:detector/*
+              - Sid: NotTheOtherEnvironment
+                Effect: Deny
+                Action: "*"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Environment: dev
+      Tags:
+        - { Key: Environment, Value: prod }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  ProdGitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-ha-web-platform-prod-github-deploy
+      Description: GitHub Actions deploys prod with this role (OIDC, no stored keys)
+      MaxSessionDuration: 7200
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepository}:${ProdSubject}
+      Policies:
+        - PolicyName: deploy-prod
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StacksThroughExecutionRole
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/prod-*/*
+                Condition:
+                  StringEquals:
+                    cloudformation:RoleArn: !GetAtt ProdCfnExecutionRole.Arn
+                    aws:RequestedRegion: [eu-west-1, us-east-1]
+              - Sid: Stacks
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplateSummary
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/prod-*/*
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: [eu-west-1, us-east-1]
+              - Sid: LanguageExtensionsTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:aws:transform/LanguageExtensions
+              - Sid: TemplateChecks
+                Effect: Allow
+                Action: [cloudformation:ValidateTemplate, cloudformation:GetTemplateSummary]
+                Resource: "*"
+              - Sid: PassExecutionRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt ProdCfnExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: RegistryLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*" # this action does not support resource-level permissions
+              - Sid: PushImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !Sub arn:${AWS::Partition}:ecr:eu-west-1:${AWS::AccountId}:repository/aws-ha-web-platform/prod/notes-api
+              - Sid: RunMigrationTask
+                Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub arn:${AWS::Partition}:ecs:eu-west-1:${AWS::AccountId}:task-definition/prod-notes-migrate:*
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !Sub arn:${AWS::Partition}:ecs:eu-west-1:${AWS::AccountId}:cluster/prod-notes
+              - Sid: WatchTasks
+                Effect: Allow
+                Action: [ecs:DescribeTasks, ecs:DescribeServices]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ecs:eu-west-1:${AWS::AccountId}:task/prod-notes/*
+                  - !Sub arn:${AWS::Partition}:ecs:eu-west-1:${AWS::AccountId}:service/prod-notes/*
+              - Sid: PassMigrationRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/prod-compute-*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Sid: ReadMigrationLogs
+                Effect: Allow
+                Action: logs:GetLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:eu-west-1:${AWS::AccountId}:log-group:/aws-ha-web-platform/prod/notes-api:log-stream:migrate/*
+              - Sid: ListStaticBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::prod-edge-staticbucket-*
+              - Sid: SyncStaticFiles
+                Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject]
+                Resource: !Sub arn:${AWS::Partition}:s3:::prod-edge-staticbucket-*/static/*
+              - Sid: InvalidateStaticFiles
+                Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/*
+              - Sid: Lookups
+                Effect: Allow
+                Action: ec2:DescribeManagedPrefixLists
+                Resource: "*" # describe actions do not support resource-level permissions
+              - Sid: PublicAmiParameter
+                Effect: Allow
+                Action: ssm:GetParameters
+                Resource: !Sub arn:${AWS::Partition}:ssm:*::parameter/aws/service/ami-amazon-linux-latest/*
+      Tags:
+        - { Key: Environment, Value: prod }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+Outputs:
+  OidcProviderArn:
+    Value: !If [CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
+  WorkloadBoundaryArn:
+    Description: Passed by the deploy script as PermissionsBoundaryArn when it uses an execution role.
+    Value: !Ref WorkloadBoundary
+  DevGitHubDeployRoleArn:
+    Value: !GetAtt DevGitHubDeployRole.Arn
+  DevCfnExecutionRoleArn:
+    Value: !GetAtt DevCfnExecutionRole.Arn
+  ProdGitHubDeployRoleArn:
+    Value: !GetAtt ProdGitHubDeployRole.Arn
+  ProdCfnExecutionRoleArn:
+    Value: !GetAtt ProdCfnExecutionRole.Arn

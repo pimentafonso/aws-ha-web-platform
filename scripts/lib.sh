@@ -66,7 +66,7 @@ stack_param() {
 # deploy or delete without opening the console.
 show_stack_failures() {
   aws cloudformation describe-stack-events --stack-name "$1" --region "${2:-$REGION}" \
-    --max-items 40 --output text \
+    --output text \
     --query "StackEvents[?contains(ResourceStatus, 'FAILED')].[LogicalResourceId, ResourceStatusReason]" \
     >&2 2>/dev/null || true
 }

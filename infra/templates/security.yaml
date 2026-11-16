@@ -14,6 +14,15 @@ Parameters:
       Address that receives GuardDuty findings. Passed at deploy time and
       never committed; AWS emails a confirmation link first.
 
+  GuardDuty:
+    Type: String
+    AllowedValues: [enabled, disabled]
+    Default: enabled
+    Description: >-
+      Create the GuardDuty detector and its findings export. AWS accounts on
+      the Free plan cannot subscribe to GuardDuty (SubscriptionRequiredException),
+      so they deploy with disabled; CloudTrail and the alert topic still deploy.
+
   RuntimeMonitoring:
     Type: String
     AllowedValues: [enabled, disabled]
@@ -29,7 +38,8 @@ Parameters:
     Description: Days to keep CloudTrail logs and exported GuardDuty findings.
 
 Conditions:
-  RuntimeOn: !Equals [!Ref RuntimeMonitoring, enabled]
+  GuardDutyOn: !Equals [!Ref GuardDuty, enabled]
+  RuntimeOn: !And [!Condition GuardDutyOn, !Equals [!Ref RuntimeMonitoring, enabled]]
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -221,6 +231,7 @@ Resources:
   # ---------------------------------------------------------------------------
   Detector:
     Type: AWS::GuardDuty::Detector
+    Condition: GuardDutyOn
     Properties:
       Enable: true
       FindingPublishingFrequency: FIFTEEN_MINUTES
@@ -241,6 +252,7 @@ Resources:
 
   FindingsExport:
     Type: AWS::GuardDuty::PublishingDestination
+    Condition: GuardDutyOn
     DependsOn: AuditBucketPolicy
     Properties:
       DetectorId: !Ref Detector
@@ -309,6 +321,7 @@ Outputs:
   AuditBucketName:
     Value: !Ref AuditBucket
   DetectorId:
+    Condition: GuardDutyOn
     Value: !Ref Detector
     Export: { Name: !Sub "${AWS::StackName}-DetectorId" }
   SecurityAlertsTopicArn:

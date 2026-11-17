@@ -264,6 +264,7 @@ Resources:
                       - ec2.amazonaws.com
                       - ecs-tasks.amazonaws.com
                       - monitoring.rds.amazonaws.com
+                      - rds.amazonaws.com # RDS passes the Enhanced Monitoring role itself, in CreateDBInstance
                       - vpc-flow-logs.amazonaws.com
               - Sid: OwnInstanceProfiles
                 Effect: Allow
@@ -538,6 +539,7 @@ Resources:
                       - ec2.amazonaws.com
                       - ecs-tasks.amazonaws.com
                       - monitoring.rds.amazonaws.com
+                      - rds.amazonaws.com # RDS passes the Enhanced Monitoring role itself, in CreateDBInstance
                       - vpc-flow-logs.amazonaws.com
               - Sid: OwnInstanceProfiles
                 Effect: Allow

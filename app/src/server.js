@@ -11,6 +11,18 @@ const pool = await createPool(config.db);
 pool.on('error', (err) => logger.error({ err: err.message }, 'idle database client error'));
 if (config.migrateOnStart) await migrate(pool, logger);
 
+// Open the first database connection now rather than on the first request.
+// On ECS that connection is the slowest: the first IAM token also fetches
+// the task role's credentials, and the first IAM login follows. Measured on
+// dev, the first /ready after a deploy took 5.3 s and timed out. Failure is
+// only logged, so a database that is down does not stop the task starting;
+// /health stays up and /ready reports it.
+const warmStart = Date.now();
+pool
+  .query('SELECT 1')
+  .then(() => logger.info({ ms: Date.now() - warmStart }, 'database connection ready'))
+  .catch((err) => logger.warn({ err: err.message, ms: Date.now() - warmStart }, 'database warm-up failed'));
+
 const cache = createCache(config.redisUrl, config.cacheTtlSeconds, logger, {
   password: config.redisPassword,
 });

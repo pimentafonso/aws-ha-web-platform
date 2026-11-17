@@ -21,11 +21,14 @@ export async function createPool(dbConfig) {
     user: dbConfig.user,
     // pg calls a password function for every new connection. An IAM token is
     // valid for 15 minutes, and signing one is a local computation with the
-    // task role's credentials (no network call).
+    // task role's credentials. Only the first token makes a network call, to
+    // fetch those credentials from the ECS credentials endpoint.
     password: dbConfig.authMode === 'iam' ? iamTokenSigner(dbConfig) : dbConfig.password,
     ssl,
     max: dbConfig.poolMax,
-    connectionTimeoutMillis: 5000,
+    // 10 s: the first connection of a new task (credentials, IAM login, TLS)
+    // took over 5 s on dev; later ones take milliseconds.
+    connectionTimeoutMillis: 10000,
     idleTimeoutMillis: 30000,
   });
 }

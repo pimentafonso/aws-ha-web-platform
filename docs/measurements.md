@@ -164,7 +164,7 @@ Public log check: the account ID appears as `***` throughout, including in the r
 
 ### Smoke test
 
-The same checks as session 1, all passing, with one repeat: the first `/ready` after the deploy again returned **503 after 5.3 s**, and the next one 200 in 1.4 s. So the slow first database connection reproduces. A likely cause is that the first `getAuthToken()` also fetches the task role's credentials from the ECS credentials endpoint, on top of the first IAM-authenticated login. I have not confirmed this.
+The same checks as session 1, all passing, with one repeat: the first `/ready` after the deploy again returned **503 after 5.3 s**, and the next one 200 in 1.4 s. So the slow first database connection reproduces. A likely cause is that the first `getAuthToken()` also fetches the task role's credentials from the ECS credentials endpoint, on top of the first IAM-authenticated login. I have not confirmed this. Since then the app opens its first connection at start-up rather than on the first request, and the connect timeout is 10 s instead of 5. That fix has not run on AWS yet; the next deploy will show whether the first `/ready` is fast.
 
 ### Teardown
 

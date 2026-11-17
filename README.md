@@ -331,7 +331,7 @@ One-off set-up, to do before the first CI deploy (none of it exists yet):
 1. `bash scripts/deploy.sh account` with my own credentials. It creates the OIDC provider, the deploy and execution roles, and the boundary.
 2. In the repository settings:
    - the environments `dev` and `prod`, each allowed to deploy only from `main`, with `prod` requiring my approval;
-   - a repository variable `AWS_ACCOUNT_ID`;
+   - a repository secret `AWS_ACCOUNT_ID`. A secret rather than a variable: the repository is public, and GitHub masks secret values in the Actions logs, which would otherwise show the account ID in the role ARN;
    - a repository secret `ALERT_EMAIL`;
    - a `prod` environment secret `DOMAIN_NAME`.
 3. Branch protection on `main`: changes only through pull requests, with CI required to pass.

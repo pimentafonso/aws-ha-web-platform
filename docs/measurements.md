@@ -175,3 +175,97 @@ The leftover check came back clean, the same as session 1. What remains: the acc
 ### Spend
 
 At 02:33 UTC on 17 November the credit balance still read $179.72, and the budget's actual spend $0.00. Billing has not caught up with either session yet.
+
+## Session 3: prod and failover tests, 17 November 2026
+
+Prod deployed from my laptop with my own credentials, served at a subdomain of a domain I own (written `notes.example.com` here), delegated from Cloudflare to the Route 53 zone with four NS records. Prod was up from 10:31 to 12:46 UTC (2 hours 15 minutes), counting the failed attempts below.
+
+```
+DB_INSTANCE_CLASS=db.t4g.micro DB_BACKUP_RETENTION_DAYS=1 \
+  DOMAIN_NAME=notes.example.com ALERT_EMAIL=... bash scripts/deploy.sh prod
+```
+
+### What the Free plan refused
+
+Prod is designed for a Multi-AZ `db.t4g.small` with 7 days of backups. The Free plan refused both, each after the data stack had spent about 11 minutes creating and then rolling back:
+
+1. *"The specified backup retention period exceeds the maximum available to free tier customers."* Dev's 1 day had been accepted.
+2. *"This instance size isn't available with free plan accounts."* for `db.t4g.small`.
+
+I added deploy-time overrides (`DB_BACKUP_RETENTION_DAYS`, `DB_INSTANCE_CLASS`) rather than changing prod's committed parameters, and deployed prod with a **Multi-AZ `db.t4g.micro` and 1 day of backups**. The Free plan accepted Multi-AZ. Every number below is for that database, not the designed `db.t4g.small`.
+
+### Other things that went wrong
+
+- My `aws login` session expired after about 12 hours, during the data stack's create. CloudFormation finished the stack; only my CLI's wait failed with `ExpiredToken`. I signed in again and re-ran the script.
+- `docker login` to ECR failed with *"The stub received bad data"*. The ECR token was 2,592 characters, over the 2,560-byte limit of Windows Credential Manager, where Docker Desktop stores logins. The image was pushed on a second attempt, and the script then found it in ECR. Dev's sessions had not hit this.
+- `destroy.sh prod` failed on two paths dev never runs. The Windows AWS CLI ends every line of text output with CRLF, and Bash kept the CR, so the ACM validation record's value broke the Route 53 change JSON and a parameter name failed to match. `lib.sh` now strips CR from all AWS CLI output. Then turning off the database's deletion protection with `update-stack --use-previous-template` got *"No updates are to be performed"* on the data stack, which uses the `AWS::LanguageExtensions` transform. Sending the repository's template instead worked, and `destroy.sh` now does that.
+
+### Deploy
+
+Create times from CloudFormation stack events:
+
+| Stack | Created in |
+| --- | --- |
+| `prod-dns` (hosted zone) | 46 s |
+| `prod-network` (2 NAT gateways, 4 interface endpoints in 2 AZs) | 2 min 1 s |
+| `prod-logging` | 20 s |
+| `prod-data` (Multi-AZ PostgreSQL, 2-node Valkey) | 18 min 13 s |
+| `prod-registry` | 5 s |
+| `prod-compute` (create, service off) | 3 min 38 s |
+| `prod-compute` (update, service on) | 1 min 12 s |
+| `prod-edge-global` (ACM certificate, WAF, us-east-1) | 2 min 38 s |
+| `prod-edge` (CloudFront) | 3 min 29 s |
+| `prod-observability` | 14 s |
+
+Inside `prod-data`, the Multi-AZ instance took 17 min 48 s and Valkey 6 min 3 s. The ACM certificate took 2 min 35 s to validate over DNS. The arm64 image build and push took 25 s under QEMU, with the dependency layers cached from dev. The last script run, from compute onwards, took 922 s.
+
+### Smoke test
+
+Through `https://notes.example.com`: `/ready` 200 on the first call (0.87 s), `/health` 200, `/static/index.html` 200, create 201, read 200 with `X-App-Cache: MISS` then `HIT`, list 200, delete 204, read after delete 404. HTTP redirects to HTTPS (301), HSTS is set, and the certificate is issued by Amazon. A request straight to the load balancer's DNS name timed out: its security group only admits CloudFront.
+
+The first-connection fix from session 2 worked. Both tasks logged `database connection ready` at start-up after **7.2 and 7.4 s**, longer than the old 5 s connect timeout, which explains the 503s in dev. With the connection opened at start-up, no request waited for it.
+
+### Failover tests
+
+Each test ran `loadtest/latency.js` with `--out csv` against prod and triggered the failure about a minute in. Error windows come from the per-request CSV; recovery times from ECS, RDS and ElastiCache events.
+
+**1. One of two Fargate tasks stopped** (`aws ecs stop-task`, 11:48:25 UTC, k6 at 10 iterations a second).
+
+| Event | Time after the stop |
+| --- | --- |
+| Task deregistered from the target group | 28 s |
+| Replacement task started | 29 s |
+| Replacement registered and healthy | 58 s |
+| Service steady again (2 of 2) | 67 s |
+
+**0 failed requests** of the 658 sent in the minute after the stop. The other task carried the traffic.
+
+**2. RDS Multi-AZ failover** (`aws rds reboot-db-instance --force-failover`, 11:58:41 UTC, k6 at 2 iterations a second).
+
+RDS reported *failover started* at 11:58:58 and *completed* at 11:59:27: **29 s**. The app took **about 6 minutes** to recover: database routes returned 500 or 503 from 11:59:02 until about 12:05:02. `/health` kept answering 200, so the ALB kept both tasks in service, as designed. 531 of 863 requests in the 7-minute run failed (61.5%).
+
+The PostgreSQL log of the new primary shows why. Its IAM authentication service (`rdsauthproxy` on port 1108) at first refused connections, then answered `403 Forbidden` to the app's tokens, which signed in fine before and after. Logins waiting on it held connection slots until they timed out, so other connections got *"sorry, too many clients already"*. Sign-ins started succeeding again at about 12:05. I changed nothing; it recovered on its own. The `prod-api-5xx` alarm fired at 12:02:22 (3 min 20 s after the first error) and cleared at 12:12:22.
+
+So with IAM database authentication, a Multi-AZ failover cost about 6 minutes of database errors, not the 29 s RDS reports. This is one run, on a `db.t4g.micro` that the Free plan forced; I cannot tell from one run whether the instance size mattered. Options I have not tried yet: RDS Proxy in front of the database, a password-based fallback login, or backing off new connections while sign-ins fail.
+
+**3. Valkey failover** (`aws elasticache test-failover`, 12:10:16 UTC, k6 at 2 iterations a second).
+
+ElastiCache reported the failover from node `-001` to `-002` completed at 12:10:40, **22 s** after the API call registered (12:10:18). The app logged Redis errors (`ECONNREFUSED`, then connection timeouts) from 12:10:20 to 12:10:54, 34 s, and served those reads from PostgreSQL. **0 failed requests** of 687. Every cached read in 12:10:30–12:11:00 was a miss; hits came back from 12:11:00.
+
+### WAF rate limit
+
+Not planned this way: test 1's k6 run at 10 iterations a second went over the rate rule's limit of 1,000 requests per IP per 5 minutes. After 1,408 requests in 128 s, WAF answered `403` to every request from my IP, 2,337 of them. The WAF metric `BlockedRequests` for `rate-limit-per-ip` adds up to 2,338 over 11:49–11:53. The block lifted between 34 s and 4 min 13 s after the run ended: a request at 11:53:52 was still blocked, and one at 11:57:31 got through. The later tests ran at 2 iterations a second to stay under the limit.
+
+### Teardown
+
+```
+CONFIRM_PROD=yes PURGE_RETAINED=yes bash scripts/destroy.sh prod
+```
+
+Four runs because of the two bugs above: 741 s, 128 s and 30 s, each failing, then 767 s for the database, cache, logging and network stacks. With `PURGE_RETAINED=yes` it also deleted the final database snapshot and scheduled the data key for deletion.
+
+The leftover check (the same list as session 1, in eu-west-1 and us-east-1, plus CloudFront distributions, Route 53 hosted zones and ACM certificates) found nothing billable: only the account stacks, their audit bucket and the billing alarm. The hosted zone existed for about 2 hours; Route 53 does not charge for a zone deleted within 12 hours of being created.
+
+### Spend
+
+At 12:48 UTC on 17 November the credit balance still read $179.72 and both budgets $0.00, the same as before sessions 1 and 2. Billing has not caught up with any of the three sessions yet.

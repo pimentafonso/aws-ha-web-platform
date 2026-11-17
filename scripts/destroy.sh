@@ -105,6 +105,41 @@ delete_logging_stack() {
   die "deleting $stack failed"
 }
 
+# CloudFormation disables the distribution before deleting it. If the
+# disable has not finished propagating, the delete fails with "has not been
+# disabled" (seen right after a deploy). Wait until the distribution is
+# deployed again, then retry.
+delete_edge_stack() {
+  local stack=$ENV-edge attempt distribution
+  [[ $(stack_status "$stack") != NONE ]] || { info "$stack: not found, skipping"; return; }
+  empty_bucket "$(stack_output "$stack" StaticBucketName)"
+  distribution=$(aws cloudformation describe-stack-resource --stack-name "$stack" --region "$REGION"     --logical-resource-id Distribution --query StackResourceDetail.PhysicalResourceId --output text 2>/dev/null || true)
+  for attempt in 1 2 3; do
+    log "deleting $stack (attempt $attempt)"
+    aws cloudformation delete-stack --stack-name "$stack" --region "$REGION"
+    if aws cloudformation wait stack-delete-complete --stack-name "$stack" --region "$REGION"; then
+      return
+    fi
+    [[ -n $distribution && $distribution != None ]] || break
+    info "waiting for distribution $distribution to finish deploying"
+    aws cloudfront wait distribution-deployed --id "$distribution" || true
+  done
+  show_stack_failures "$stack"
+  die "deleting $stack failed"
+}
+
+# RDS Enhanced Monitoring writes to an RDSOSMetrics log group that RDS creates
+# itself, outside any stack. Remove it once no database is left in the Region.
+remove_rds_monitoring_logs() {
+  local remaining
+  remaining=$(aws rds describe-db-instances --region "$REGION" --query 'length(DBInstances)' --output text)
+  [[ $remaining == 0 ]] || return 0
+  if aws logs describe-log-groups --region "$REGION" --log-group-name-prefix RDSOSMetrics     --query 'logGroups[0].logGroupName' --output text | grep -q '^RDSOSMetrics$'; then
+    info "removing log group RDSOSMetrics (no databases left)"
+    aws logs delete-log-group --region "$REGION" --log-group-name RDSOSMetrics
+  fi
+}
+
 # ACM's DNS validation records were created in the hosted zone through the
 # certificates; Route 53 refuses to delete a zone that still has records
 # other than its own NS and SOA. Only the _<token>.<name> CNAMEs are removed.
@@ -166,10 +201,7 @@ log "destroying $ENV (account stacks security and cicd are kept)"
 
 delete_stack "$ENV-observability"
 
-if [[ $(stack_status "$ENV-edge") != NONE ]]; then
-  empty_bucket "$(stack_output "$ENV-edge" StaticBucketName)"
-fi
-delete_stack "$ENV-edge"
+delete_edge_stack
 [[ $ENV == prod ]] && delete_stack prod-edge-global "$GLOBAL_REGION"
 
 [[ $ENV == prod ]] && set_stack_param prod-compute AlbDeletionProtection false CAPABILITY_IAM
@@ -190,6 +222,7 @@ fi
 [[ $ENV == prod ]] && set_stack_param prod-data DbDeletionProtection false CAPABILITY_IAM CAPABILITY_AUTO_EXPAND
 delete_stack "$ENV-data"
 purge_deleted_secrets
+remove_rds_monitoring_logs
 
 delete_logging_stack
 delete_stack "$ENV-network"

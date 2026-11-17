@@ -11,6 +11,8 @@
 #   ALERT_EMAIL            account and observability: where alarms are emailed
 #   GUARDDUTY=disabled     account: skip the GuardDuty detector (Free plan
 #                          accounts cannot subscribe to GuardDuty)
+#   DB_BACKUP_RETENTION_DAYS  override the database backup retention (Free
+#                          plan accounts are refused more than 1 day)
 #   DOMAIN_NAME           prod: the delegated subdomain, e.g. notes.example.com
 #   IMAGE_TAG              image to deploy; default: the current commit SHA
 #   USE_EXEC_ROLE=true     deploy through the cicd stack's CloudFormation
@@ -202,7 +204,9 @@ deploy_environment() {
 
   deploy_stack "$ENV-network" network "$REGION" CAPABILITY_IAM "PermissionsBoundaryArn=$BOUNDARY"
   deploy_stack "$ENV-logging" logging "$REGION" -
-  deploy_stack "$ENV-data" data "$REGION" CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND "PermissionsBoundaryArn=$BOUNDARY"
+  local data_args=("PermissionsBoundaryArn=$BOUNDARY")
+  [[ -z ${DB_BACKUP_RETENTION_DAYS:-} ]] || data_args+=("DbBackupRetentionDays=$DB_BACKUP_RETENTION_DAYS")
+  deploy_stack "$ENV-data" data "$REGION" CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND "${data_args[@]}"
   deploy_stack "$ENV-registry" registry "$REGION" -
   push_image
 

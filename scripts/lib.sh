@@ -15,6 +15,12 @@ export AWS_PAGER=""
 # or /static/* into Windows paths before the AWS CLI sees them.
 export MSYS_NO_PATHCONV=1
 
+# The Windows AWS CLI ends every line of output with CRLF, and Bash keeps the
+# CR: values then fail to compare equal or break the JSON they are put in.
+# Strip it everywhere; on Linux this changes nothing. pipefail (set by the
+# callers) keeps the CLI's exit status.
+aws() { command aws "$@" | tr -d '\r'; }
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly REPO_ROOT
 

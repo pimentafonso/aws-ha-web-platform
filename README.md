@@ -283,6 +283,7 @@ Private values come from the environment, never from files in the repository:
 | `ALERT_EMAIL` | `deploy.sh` (all targets) | Where alarms and GuardDuty findings are emailed. AWS sends a confirmation link first. |
 | `GUARDDUTY` | `deploy.sh account` | `disabled` skips the GuardDuty detector and its findings export. Default `enabled`. My account is on the AWS Free plan, which cannot subscribe to GuardDuty, so I deploy with `disabled`. |
 | `DOMAIN_NAME` | `deploy.sh prod` | The delegated subdomain the platform serves. |
+| `DB_INSTANCE_CLASS`, `DB_BACKUP_RETENTION_DAYS` | `deploy.sh dev` and `prod` | Override the database's instance class and backup retention for one deploy. The AWS Free plan refuses prod's `db.t4g.small` and 7-day retention, so on my account I deploy prod with `db.t4g.micro` and 1 day. |
 | `IMAGE_TAG` | `deploy.sh dev` and `prod` | Image to deploy. Default: the current commit SHA. |
 | `USE_EXEC_ROLE=true` | `deploy.sh dev` and `prod` | Deploy through the environment's CloudFormation execution role, with the workload boundary on every role. CI sets it. |
 | `SKIP_DELEGATION_CHECK=true` | `deploy.sh prod` | Carry on before public DNS shows the subdomain delegated to Route 53. |

@@ -42,13 +42,15 @@ delete_stack() {
   fi
 }
 
-# set_stack_param <stack> <key> <value> <capabilities...>
-# Updates one parameter with the stack's current template, keeping every
-# other value. Used to turn deletion protection off through CloudFormation,
-# so the stack never drifts from what it manages.
+# set_stack_param <stack> <template> <key> <value> <capabilities...>
+# Updates one parameter, keeping every other value. Used to turn deletion
+# protection off through CloudFormation, so the stack never drifts from what
+# it manages. It sends the repository's template: with the data stack's
+# AWS::LanguageExtensions transform, --use-previous-template made
+# CloudFormation answer "No updates are to be performed".
 set_stack_param() {
-  local stack=$1 key=$2 value=$3 k
-  shift 3
+  local stack=$1 template=$2 key=$3 value=$4 k
+  shift 4
   [[ $(stack_status "$stack") != NONE ]] || return 0
   [[ $(stack_param "$stack" "$key") != "$value" ]] || return 0
   local -a params=()
@@ -62,7 +64,7 @@ set_stack_param() {
   done
   log "$stack: setting $key=$value before deletion"
   aws cloudformation update-stack --stack-name "$stack" --region "$REGION" \
-    --use-previous-template --parameters "${params[@]}" --capabilities "$@" >/dev/null
+    --template-body "file://$(aws_path "$REPO_ROOT/infra/templates/$template.yaml")" --parameters "${params[@]}" --capabilities "$@" >/dev/null
   if ! aws cloudformation wait stack-update-complete --stack-name "$stack" --region "$REGION"; then
     show_stack_failures "$stack"
     die "updating $stack failed"
@@ -204,7 +206,7 @@ delete_stack "$ENV-observability"
 delete_edge_stack
 [[ $ENV == prod ]] && delete_stack prod-edge-global "$GLOBAL_REGION"
 
-[[ $ENV == prod ]] && set_stack_param prod-compute AlbDeletionProtection false CAPABILITY_IAM
+[[ $ENV == prod ]] && set_stack_param prod-compute compute AlbDeletionProtection false CAPABILITY_IAM
 delete_stack "$ENV-compute"
 
 if [[ $ENV == prod ]]; then
@@ -219,7 +221,7 @@ if [[ $(stack_status "$ENV-data") != NONE ]]; then
   data_key=$(stack_output "$ENV-data" DataKeyArn)
   db_instance=$(stack_output "$ENV-data" DbInstanceId)
 fi
-[[ $ENV == prod ]] && set_stack_param prod-data DbDeletionProtection false CAPABILITY_IAM CAPABILITY_AUTO_EXPAND
+[[ $ENV == prod ]] && set_stack_param prod-data data DbDeletionProtection false CAPABILITY_IAM CAPABILITY_AUTO_EXPAND
 delete_stack "$ENV-data"
 purge_deleted_secrets
 remove_rds_monitoring_logs

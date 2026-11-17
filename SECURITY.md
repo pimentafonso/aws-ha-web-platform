@@ -1,6 +1,6 @@
 # Security
 
-This document explains each security control in the platform and why it is there. _Sections are filled in as the stacks are built._
+This document explains each security control in the platform and why it is there, and what deploying it to a real account in November 2026 taught me.
 
 ## Reporting a vulnerability
 
@@ -28,9 +28,20 @@ This is a personal reference project. If you find a security issue, please open 
 | Edge | AWS WAF on the CloudFront distribution in prod: Amazon IP reputation list, a per-IP rate limit (1,000 requests per 5 minutes), the common rule set and known bad inputs | Common attacks and floods are dropped at the edge before they reach the ALB or cost Fargate time. AWS keeps the managed groups up to date. Blocked and counted requests are logged to a KMS-encrypted log group in us-east-1. |
 | Edge | Static bucket: Block Public Access, ACLs disabled, no website endpoint, HTTPS required, readable only by this distribution through origin access control | The only way to read the files is through CloudFront, where TLS and WAF apply. |
 | Detection | CloudTrail: one multi-Region trail for the account (management events, global services), with log file validation, to a versioned, KMS-encrypted audit bucket that is retained on stack deletion | Every API call in the account, in any Region, is recorded, and digest files prove the logs were not changed. Only CloudTrail and GuardDuty can use the key, each for its own resources. |
-| Detection | GuardDuty on CloudTrail, VPC flow and DNS logs. Findings are exported to the audit bucket, and medium or higher findings are emailed through a KMS-encrypted SNS topic. Optional plans are listed explicitly as disabled; Runtime Monitoring for Fargate is a parameter | Compromised credentials, crypto-mining and calls from known-bad addresses are flagged without my having to write the rules. Disabling plans explicitly means none can switch on through an account default and add charges unnoticed. |
+| Detection | GuardDuty on CloudTrail, VPC flow and DNS logs. Findings are exported to the audit bucket, and medium or higher findings are emailed through a KMS-encrypted SNS topic. Optional plans are listed explicitly as disabled; Runtime Monitoring for Fargate is a parameter | Compromised credentials, crypto-mining and calls from known-bad addresses are flagged without my having to write the rules. Disabling plans explicitly means none can switch on through an account default and add charges unnoticed. **Not running on my account:** it is on the AWS Free plan, which cannot subscribe to GuardDuty, so I deploy with `GUARDDUTY=disabled`. CloudTrail, flow logs and the WAF and access logs still run. |
 | Detection | Access logs for the ALB, CloudFront and the static bucket in a per-environment bucket that only those log services may write to, HTTPS only | A request can be traced from the edge to the task, using the ALB trace id that the API also logs. |
 
 ## What is not in this repository
 
-No AWS account IDs, access keys, secrets or real domain names are committed. Account-specific values are passed in at deploy time through environment variables or GitHub repository variables.
+No AWS account IDs, access keys, secrets or real domain names are committed. Account-specific values are passed in at deploy time through environment variables or GitHub secrets. The account ID is a repository secret rather than a variable, so GitHub masks it in the public Actions logs, including inside role ARNs and the ECR host name; I searched a full deploy log for 12-digit account numbers and found none.
+
+## What deploying taught me
+
+Measured details are in [docs/measurements.md](docs/measurements.md).
+
+- **IAM database authentication has an availability cost.** In a forced RDS Multi-AZ failover, RDS switched to the standby in 29 seconds, but the new primary's IAM authentication service refused connections and then rejected valid tokens for about 6 minutes. Logins waiting on it filled the connection slots, and every database request failed until it recovered on its own. Keeping passwords out of the service is still the right default, but it has to be paired with something that rides out a failover, such as RDS Proxy or backoff in the app. I have not yet measured either.
+- **GitHub's OIDC subject was not the one I wrote.** This repository gets GitHub's immutable subjects, `repo:<owner>@<owner id>/<repo>@<repo id>:environment:<env>`. STS refused the older `repo:<owner>/<repo>:...` form. The immutable form is stricter, because it pins the IDs as well as the names, so the roles now trust it.
+- **The least-privilege roles were missing two permissions, which only a real deploy showed.** CloudFormation expands the `AWS::LanguageExtensions` transform as the stack's service role, so the execution role needed `cloudformation:CreateChangeSet` on the transform. And RDS passes the Enhanced Monitoring role itself during `CreateDBInstance`, so `iam:PassedToService` is `rds.amazonaws.com`. Both were refused, both were added narrowly, and nothing else was widened.
+- **The WAF rate rule works.** A k6 run at 10 requests a second from my laptop was blocked after 1,408 requests in 128 seconds, and WAF's metric matched the client's count of blocked requests.
+- **No long-lived keys for me either.** The CLI signs in with `aws login`: console credentials, MFA, short-lived and refreshed automatically. IAM Identity Center would have been the usual choice, but enabling it with AWS Organizations upgrades a Free plan account and forfeits its credits.
+- **IAM sign-in makes the first connection slow.** The first IAM-authenticated connection from a new task took 7.2 to 7.4 seconds in prod. The app now opens it at start-up, before any request depends on it.

@@ -49,7 +49,7 @@ export function notesRouter({ pool, cache }) {
 
     const cached = await cache.get(cacheKey(id));
     if (cached) {
-      res.set('X-Cache', 'HIT');
+      res.set('X-App-Cache', 'HIT');
       return res.json(cached);
     }
 
@@ -60,7 +60,7 @@ export function notesRouter({ pool, cache }) {
     if (rows.length === 0) return res.status(404).json({ error: 'note not found' });
 
     await cache.set(cacheKey(id), rows[0]);
-    res.set('X-Cache', 'MISS');
+    res.set('X-App-Cache', 'MISS');
     res.json(rows[0]);
   });
 

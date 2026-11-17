@@ -429,7 +429,7 @@ Resources:
               - Sid: Logs
                 Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
-                Resource: !Sub "${AppLogGroup.Arn}:log-stream:*"
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AppLogGroup}:log-stream:*" # GetAtt Arn already ends in :*
               - Sid: CacheToken
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
@@ -478,7 +478,7 @@ Resources:
               - Sid: Logs
                 Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
-                Resource: !Sub "${AppLogGroup.Arn}:log-stream:*"
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AppLogGroup}:log-stream:*" # GetAtt Arn already ends in :*
               - Sid: DatabaseMasterSecret
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue

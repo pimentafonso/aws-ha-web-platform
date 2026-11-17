@@ -3,6 +3,7 @@
   { "ParameterKey": "VpcCidr", "ParameterValue": "10.10.0.0/16" },
   { "ParameterKey": "NatMode", "ParameterValue": "instance" },
   { "ParameterKey": "NatCount", "ParameterValue": "1" },
+  { "ParameterKey": "NatInstanceType", "ParameterValue": "t4g.micro" },
   { "ParameterKey": "EnableInterfaceEndpoints", "ParameterValue": "false" },
   { "ParameterKey": "LoggingMode", "ParameterValue": "minimal" }
 ]

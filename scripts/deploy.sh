@@ -9,7 +9,9 @@
 #
 # Environment (private values never come from files in the repository):
 #   ALERT_EMAIL            account and observability: where alarms are emailed
-#   DOMAIN_NAME            prod: the delegated subdomain, e.g. notes.example.com
+#   GUARDDUTY=disabled     account: skip the GuardDuty detector (Free plan
+#                          accounts cannot subscribe to GuardDuty)
+#   DOMAIN_NAME           prod: the delegated subdomain, e.g. notes.example.com
 #   IMAGE_TAG              image to deploy; default: the current commit SHA
 #   USE_EXEC_ROLE=true     deploy through the cicd stack's CloudFormation
 #                          execution role and workload boundary (CI sets this)
@@ -68,7 +70,7 @@ deploy_stack() {
 deploy_account() {
   [[ ${USE_EXEC_ROLE:-} != true ]] || die "the account stacks are deployed with my own credentials, not the execution role"
   require_env ALERT_EMAIL
-  deploy_stack security security "$REGION" - "AlertEmail=$ALERT_EMAIL"
+  deploy_stack security security "$REGION" - "AlertEmail=$ALERT_EMAIL" "GuardDuty=${GUARDDUTY:-enabled}"
   deploy_stack cicd cicd "$REGION" CAPABILITY_NAMED_IAM
   log "cicd outputs"
   aws cloudformation describe-stacks --stack-name cicd --region "$REGION" \

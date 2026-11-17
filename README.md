@@ -36,7 +36,7 @@ The API itself is deliberately small, so the focus stays on the infrastructure a
 | `GET /ready` | Readiness: checks PostgreSQL (required) and Redis (optional). Returns 503 if the database is unreachable. |
 | `POST /api/notes` | Create a note (`title`, optional `content`). |
 | `GET /api/notes` | List recent notes (`?limit=`, max 100). |
-| `GET /api/notes/:id` | Read a note through the cache. The `X-Cache: HIT|MISS` header shows which path served it. |
+| `GET /api/notes/:id` | Read a note through the cache. The `X-App-Cache: HIT|MISS` header shows which path served it. (Not `X-Cache`: CloudFront sets its own `X-Cache` and replaces the origin's.) |
 | `DELETE /api/notes/:id` | Delete a note and invalidate its cache entry. |
 
 Behaviours that matter for the platform:
@@ -102,9 +102,9 @@ Everything runs in **eu-west-1 (Ireland)**, with one exception that AWS imposes:
 
 - **Three subnet tiers in two AZs.** Public subnets hold only the ALB and the NAT Gateways. Private-app subnets hold the Fargate tasks. Private-data subnets hold RDS and ElastiCache and have **no default route at all**, so even a misconfigured database cannot reach the internet. Each tier gets a /24 per AZ, carved from a /16 with `Fn::Cidr`, which leaves room for more tiers later.
 - **No public IPs by default.** No subnet sets `MapPublicIpOnLaunch`. The NAT Gateways use Elastic IPs and the ALB manages its own addresses, so nothing else can end up with a public IP by accident.
-- **NAT: managed gateways in prod, one small NAT instance in dev** (`NatMode`, `NatCount`). A NAT Gateway costs $0.048/hour plus $0.048 per GB processed. A `t4g.nano` NAT instance costs $0.0046/hour plus $0.70 a month for its 8 GB gp3 disk, with no per-GB charge. Either way, each NAT needs a public IPv4 address at $0.005/hour, which makes the address the largest part of dev's network cost. The instance runs Amazon Linux 2023 and does NAT with a single iptables `MASQUERADE` rule set up in user data. It has no SSH key, no inbound SSH, IMDSv2 only and an encrypted disk, and I reach it through SSM Session Manager. What I give up in dev:
+- **NAT: managed gateways in prod, one small NAT instance in dev** (`NatMode`, `NatCount`). A NAT Gateway costs $0.048/hour plus $0.048 per GB processed. A `t4g.nano` NAT instance costs $0.0046/hour plus $0.70 a month for its 8 GB gp3 disk, with no per-GB charge. Dev runs a `t4g.micro` ($0.0092/hour) instead: my account is on the AWS Free plan, which refuses instance types that are not Free Tier eligible, and `t4g.nano` is not. Either way, each NAT needs a public IPv4 address at $0.005/hour, which makes the address the largest part of dev's network cost. The instance runs Amazon Linux 2023 and does NAT with a single iptables `MASQUERADE` rule set up in user data. It has no SSH key, no inbound SSH, IMDSv2 only and an encrypted disk, and I reach it through SSM Session Manager. What I give up in dev:
   - The instance is not self-healing. If it fails, the private-app subnets lose outbound internet until I replace it. Routes point at a fixed network interface rather than at the instance, so a replacement only needs that interface reattached.
-  - Its bandwidth is that of a `t4g.nano`, which is plenty for test traffic.
+  - Its bandwidth is that of a `t4g.micro`, which is plenty for test traffic.
   - I own its OS patching.
 
   In prod, `NatCount` 2 gives each AZ its own managed gateway, so losing an AZ only affects that AZ. With a single NAT in AZ a, losing AZ a would also cut outbound access for AZ b. Each private-app subnet has its own route table in every mode, so switching between modes or counts only changes route targets, and the Elastic IPs stay the same.
@@ -281,6 +281,7 @@ Private values come from the environment, never from files in the repository:
 | Variable | Used by | Purpose |
 |---|---|---|
 | `ALERT_EMAIL` | `deploy.sh` (all targets) | Where alarms and GuardDuty findings are emailed. AWS sends a confirmation link first. |
+| `GUARDDUTY` | `deploy.sh account` | `disabled` skips the GuardDuty detector and its findings export. Default `enabled`. My account is on the AWS Free plan, which cannot subscribe to GuardDuty, so I deploy with `disabled`. |
 | `DOMAIN_NAME` | `deploy.sh prod` | The delegated subdomain the platform serves. |
 | `IMAGE_TAG` | `deploy.sh dev` and `prod` | Image to deploy. Default: the current commit SHA. |
 | `USE_EXEC_ROLE=true` | `deploy.sh dev` and `prod` | Deploy through the environment's CloudFormation execution role, with the workload boundary on every role. CI sets it. |
@@ -330,7 +331,7 @@ One-off set-up, to do before the first CI deploy (none of it exists yet):
 1. `bash scripts/deploy.sh account` with my own credentials. It creates the OIDC provider, the deploy and execution roles, and the boundary.
 2. In the repository settings:
    - the environments `dev` and `prod`, each allowed to deploy only from `main`, with `prod` requiring my approval;
-   - a repository variable `AWS_ACCOUNT_ID`;
+   - a repository secret `AWS_ACCOUNT_ID`. A secret rather than a variable: the repository is public, and GitHub masks secret values in the Actions logs, which would otherwise show the account ID in the role ARN;
    - a repository secret `ALERT_EMAIL`;
    - a `prod` environment secret `DOMAIN_NAME`.
 3. Branch protection on `main`: changes only through pull requests, with CI required to pass.

@@ -219,6 +219,13 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:RequestedRegion: [eu-west-1, us-east-1]
+              # CloudFormation expands the data stack's AWS::LanguageExtensions
+              # transform as the stack's service role, so this role needs it
+              # too, not only the deploy role that starts the change set.
+              - Sid: LanguageExtensionsTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:aws:transform/LanguageExtensions
               - Sid: CreateBoundedRoles
                 Effect: Allow
                 Action:
@@ -486,6 +493,13 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:RequestedRegion: [eu-west-1, us-east-1]
+              # CloudFormation expands the data stack's AWS::LanguageExtensions
+              # transform as the stack's service role, so this role needs it
+              # too, not only the deploy role that starts the change set.
+              - Sid: LanguageExtensionsTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:aws:transform/LanguageExtensions
               - Sid: CreateBoundedRoles
                 Effect: Allow
                 Action:

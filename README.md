@@ -2,7 +2,7 @@
 
 A highly available web platform on AWS, defined entirely in CloudFormation, running a small Node.js/Express API on ECS Fargate across two Availability Zones.
 
-> **Status:** work in progress. Sections marked _TBD_ will be filled in as each stack is built. Every figure in this README (cost, deploy time, failover time) is measured, not estimated, and says how it was measured.
+> **Status:** deployed, measured and torn down on real AWS in November 2026, in three sessions: dev from my laptop, dev from GitHub Actions, and prod with failover tests. Nothing is running now. Every deploy time, latency and failover figure in this README was measured, and says how and when; the full log, including what went wrong, is in [docs/measurements.md](docs/measurements.md). Real spend is still to come from AWS billing. Prices in [Design decisions](#design-decisions-and-trade-offs) are dated list prices, not measurements.
 
 ## Contents
 
@@ -48,34 +48,9 @@ Behaviours that matter for the platform:
 
 ## Architecture
 
-### Built so far
+![Architecture as deployed in prod: CloudFront and WAF in front of an ALB, two Fargate tasks in two AZs, RDS PostgreSQL Multi-AZ and Valkey with a replica in private data subnets](docs/images/architecture-current.svg)
 
-![Current architecture: the Notes API, PostgreSQL and Redis running locally in docker compose](docs/images/architecture-current.svg)
-
-Nothing is deployed to AWS yet. PostgreSQL and Redis stand in locally for RDS and ElastiCache. All the stacks in [`infra/templates/`](infra/templates/), the deploy and teardown scripts and the CI workflow are written and pass lint, but nothing has been deployed. This diagram is updated as each stack lands.
-
-### Target
-
-<!-- TBD: replace with a full-size exported diagram in docs/images/architecture.png -->
-
-```mermaid
-flowchart LR
-    user([User]) --> r53[Route 53]
-    r53 --> cf[CloudFront + AWS WAF<br/>ACM TLS]
-    cf -->|/static/*| s3[(S3<br/>static assets)]
-    cf -->|/api/*| alb[Application Load Balancer<br/>public subnets, 2 AZs]
-
-    subgraph vpc[VPC: private subnets in AZ a and AZ b]
-        alb --> ecsA[ECS Fargate task<br/>AZ a]
-        alb --> ecsB[ECS Fargate task<br/>AZ b]
-        ecsA & ecsB --> rds[(RDS PostgreSQL<br/>Multi-AZ)]
-        ecsA & ecsB --> redis[(ElastiCache Valkey<br/>primary + replica)]
-    end
-
-    ecsA & ecsB -.-> sm[Secrets Manager]
-    kms[KMS] -.encrypts.-> rds & redis & s3 & sm
-    ct[CloudTrail] ~~~ gd[GuardDuty] ~~~ cw[CloudWatch]
-```
+This is what I deployed to prod on 17 November 2026. Dev is the same templates with smaller settings: one NAT instance instead of two NAT Gateways, no interface endpoints, a single-AZ database, one cache node, one task, and the CloudFront default domain with no WAF. GuardDuty is drawn dashed because my account's Free plan cannot subscribe to it.
 
 | Stack | Template | Contents |
 |---|---|---|
@@ -115,9 +90,9 @@ Everything runs in **eu-west-1 (Ireland)**, with one exception that AWS imposes:
 
 ### Data (`infra/templates/data.yaml`)
 
-At list prices, over a 730-hour month, the data stack comes to about **$26.68 a month in dev** (about $0.037/hour) and **$77.11 in prod** (about $0.106/hour). Together with the network stack, that is $34.39 in dev and $219.71 in prod.
+At list prices, over a 730-hour month, the data stack comes to about **$26.68 a month in dev** (about $0.037/hour) and **$77.11 in prod** (about $0.106/hour). Together with the network stack, that is $37.75 in dev and $219.71 in prod.
 
-- **PostgreSQL 17 on RDS: single-AZ `db.t4g.micro` in dev, Multi-AZ `db.t4g.small` in prod** (`DbInstanceClass`, `DbMultiAz`). The micro costs $0.017/hour single-AZ. The small costs $0.069/hour Multi-AZ: twice its single-AZ price, because the standby is a full second instance in the other AZ, kept in sync and promoted automatically if the primary or its AZ fails. gp3 storage is $0.127 per GB-month, or $0.254 for Multi-AZ, and 20 GiB is the minimum. For prod I passed over `db.t4g.micro` (1 GiB of memory, little for PostgreSQL) and the larger `db.t4g.medium` ($0.138/hour Multi-AZ) and `db.m7g.large` ($0.372/hour Multi-AZ), which are out of proportion for a demo that runs on credits. What I give up in dev is failover: if the instance or AZ a fails, the API is down until RDS recovers it. The t4g classes run in unlimited CPU-credit mode, so sustained load above the baseline is billed per surplus vCPU-hour ($0.075 or $0.09 in the price list).
+- **PostgreSQL 17 on RDS: single-AZ `db.t4g.micro` in dev, Multi-AZ `db.t4g.small` in prod** (`DbInstanceClass`, `DbMultiAz`). The micro costs $0.017/hour single-AZ. The small costs $0.069/hour Multi-AZ: twice its single-AZ price, because the standby is a full second instance in the other AZ, kept in sync and promoted automatically if the primary or its AZ fails. gp3 storage is $0.127 per GB-month, or $0.254 for Multi-AZ, and 20 GiB is the minimum. For prod I passed over `db.t4g.micro` (1 GiB of memory, little for PostgreSQL, though see below) and the larger `db.t4g.medium` ($0.138/hour Multi-AZ) and `db.m7g.large` ($0.372/hour Multi-AZ), which are out of proportion for a demo that runs on credits. What I give up in dev is failover: if the instance or AZ a fails, the API is down until RDS recovers it. My account is on the AWS Free plan, which refuses `db.t4g.small` and more than 1 day of backups, so I deployed prod with `DB_INSTANCE_CLASS=db.t4g.micro` and `DB_BACKUP_RETENTION_DAYS=1`, still Multi-AZ. Prod's parameter file keeps the designed values. The t4g classes run in unlimited CPU-credit mode, so sustained load above the baseline is billed per surplus vCPU-hour ($0.075 or $0.09 in the price list).
 - **TLS required, storage encrypted.** The parameter group sets `rds.force_ssl=1`, so plaintext connections are refused. The app verifies the server certificate against the RDS CA bundle in its image, and the instance pins `rds-ca-rsa2048-g1` to match. Storage, automated backups and Performance Insights data are encrypted with the data tier's KMS key.
 - **No password in the template.** With `ManageMasterUserPassword`, RDS generates the master password, keeps it in a Secrets Manager secret encrypted with the data key ($0.40 a month) and rotates it every 7 days. Only the one-off migration task ever reads this secret. The API service connects as a separate, less privileged user with IAM authentication (see Compute), so the 7-day rotation never interrupts it.
 - **Backups and deletion differ per environment.** Dev keeps backups for 1 day, has no deletion protection, and the database is deleted with the stack. Prod keeps 7 days, has deletion protection on, and takes a final snapshot when the stack deletes or replaces the instance. Backup storage up to the size of the database is free, then $0.095 per GB-month. Choosing the `DeletionPolicy` from a parameter needs the `AWS::LanguageExtensions` transform, so this stack deploys with `CAPABILITY_AUTO_EXPAND`. When the policy is `Snapshot`, the KMS key is retained too, because the snapshot cannot be restored without it. After a prod teardown, that key keeps costing $1 a month until I schedule its deletion.
@@ -130,7 +105,7 @@ At list prices, over a 730-hour month, the data stack comes to about **$26.68 a 
 
 ### Registry and compute (`infra/templates/registry.yaml`, `infra/templates/compute.yaml`)
 
-At list prices, the compute stack adds about **$33.31 a month in dev** (about $0.045/hour) and **$54.94 in prod** (about $0.075/hour). Traffic-based charges (load balancer capacity units, log ingestion, ECR storage) are left out; at test traffic they come to cents. With the network and data stacks, that makes about $67.70 a month in dev and $274.65 in prod.
+At list prices, the compute stack adds about **$33.31 a month in dev** (about $0.045/hour) and **$54.94 in prod** (about $0.075/hour). Traffic-based charges (load balancer capacity units, log ingestion, ECR storage) are left out; at test traffic they come to cents. With the network and data stacks, that makes about $71.06 a month in dev and $274.65 in prod.
 
 - **Fargate rather than EC2.** There are no instances to patch or pack containers onto. The trade-off is a higher price per vCPU and less control over the host.
 - **Graviton (Arm64) tasks: 0.25 vCPU and 0.5 GB in dev, 0.5 vCPU and 1 GB in prod.** Arm64 costs $0.03238 per vCPU-hour and $0.00356 per GB-hour, about 20% less than x86 ($0.04048 and $0.004445). That makes a dev task $0.0099/hour and a prod task $0.0198/hour. The cost is building a `linux/arm64` image: `docker buildx` does it under emulation on my x86 machine, and I checked that the image starts with the task's read-only root filesystem.
@@ -146,7 +121,7 @@ At list prices, the compute stack adds about **$33.31 a month in dev** (about $0
 
 ### Edge (`infra/templates/dns.yaml`, `edge-global.yaml`, `edge.yaml`)
 
-At list prices, the edge adds about **$0 a month in dev** and **$9.50 in prod** (about $0.013/hour): a hosted zone at $0.50 and WAF at $9, and ACM's public certificates are free. CloudFront's always-free tier covers 1 TB of data out and 10 million requests a month, far more than test traffic. With the other stacks, that makes about $67.70 a month in dev and $284.15 in prod.
+At list prices, the edge adds about **$0 a month in dev** and **$9.50 in prod** (about $0.013/hour): a hosted zone at $0.50 and WAF at $9, and ACM's public certificates are free. CloudFront's always-free tier covers 1 TB of data out and 10 million requests a month, far more than test traffic. With the other stacks, that makes about $71.06 a month in dev and $284.15 in prod.
 
 - **CloudFront in front of everything.** Viewers get TLS at the nearest edge location, and only CloudFront can reach the ALB. `/api/*` and every other path not under `/static/` go to the ALB, never cached, with all HTTP methods and the viewer's headers except `Host`. CloudFront adds the secret `X-Origin-Verify` header. `/static/*` comes from S3, cached with AWS's `CachingOptimized` policy. Viewers on HTTP are redirected to HTTPS, HTTP/2 and HTTP/3 are on, and AWS's managed security-headers policy adds HSTS, `X-Content-Type-Options`, `X-Frame-Options` and `Referrer-Policy`. Price class 100 (North America and Europe edge locations) fits a platform hosted in Ireland.
 - **Three stacks, because of one Region rule.** CloudFront only accepts a viewer certificate and a WAF web ACL from us-east-1. So `edge-global` holds just those two, in us-east-1. Everything else stays in eu-west-1: the `dns` stack's hosted zone, and the `edge` stack with the distribution, bucket and records. CloudFront is global, so a eu-west-1 stack can create the distribution, which lets it read the origin-header secret from eu-west-1 with a dynamic reference. Exports cannot be imported across Regions. The deploy script therefore passes the certificate ARN, web ACL ARN and hosted zone id between Regions, none of which is secret. The secret itself never leaves eu-west-1, so it needs no replica (which would cost $0.40 a month).
@@ -163,11 +138,11 @@ At list prices, the edge adds about **$0 a month in dev** and **$9.50 in prod** 
 
 ### Security and observability (`logging.yaml`, `security.yaml`, `observability.yaml`, WAF logs in `edge-global.yaml`)
 
-At list prices, this adds about **$4.10 a month in dev** and **$5.30 in prod**, plus **about $1 a month once for the account** and GuardDuty's usage charges. With everything else, that makes about $71.80 a month in dev and $289.45 in prod. The account-level stack is billed once, whichever environments are up.
+At list prices, this adds about **$4.10 a month in dev** and **$5.30 in prod**, plus **about $1 a month once for the account** and GuardDuty's usage charges. With everything else, that makes about $75.16 a month in dev (about $0.10/hour) and $289.45 in prod (about $0.40/hour). The account-level stack is billed once, whichever environments are up.
 
 - **CloudTrail and GuardDuty are per account, not per environment.** Dev and prod share one AWS account. A second trail would bill a second copy of every management event ($0.00002 each), and GuardDuty allows one detector per Region anyway. So `security.yaml` is deployed once, and covers both environments.
 - **CloudTrail.** One trail records management events in every Region, including us-east-1, where the edge pieces live. It includes global services such as IAM, STS and CloudFront. The first copy of management events is free. Log file validation writes signed digest files, so I can prove a log was not changed or deleted. The logs go to an audit bucket encrypted with a customer-managed key ($1 a month), which only CloudTrail and GuardDuty may use, each for its own resources. The bucket is versioned, keeps logs for 365 days, and is retained if the stack is deleted, along with its key. Data events (individual S3 and Lambda calls) are not recorded; they cost $0.10 per 100,000 and nothing here needs them.
-- **GuardDuty.** The detector analyses CloudTrail management events ($4.40 per million), VPC flow logs and DNS logs ($1.10 per GB) for this account. GuardDuty offers a 30-day free trial, and I will measure the real charge during the deploy sessions. Its optional plans are listed explicitly as disabled, so no account default can switch one on and bill it silently: S3 data events, RDS login events, EBS malware scanning, EKS and Lambda. Runtime Monitoring for Fargate is a parameter, off for now. It costs $1.50 per vCPU-month and adds an agent sidecar to every task, and dev's 0.5 GB tasks have little memory to spare. Findings are exported to the audit bucket. Findings of medium severity or higher (4.0 and above) go through EventBridge to an SNS topic encrypted with the same key, which emails me a one-line summary. The address is a deploy-time parameter and is never committed.
+- **GuardDuty.** The detector analyses CloudTrail management events ($4.40 per million), VPC flow logs and DNS logs ($1.10 per GB) for this account. GuardDuty offers a 30-day free trial. My account's Free plan cannot subscribe to GuardDuty (`SubscriptionRequiredException`), so I deploy the security stack with `GUARDDUTY=disabled` and have not measured its charge. Its optional plans are listed explicitly as disabled, so no account default can switch one on and bill it silently: S3 data events, RDS login events, EBS malware scanning, EKS and Lambda. Runtime Monitoring for Fargate is a parameter, off for now. It costs $1.50 per vCPU-month and adds an agent sidecar to every task, and dev's 0.5 GB tasks have little memory to spare. Findings are exported to the audit bucket. Findings of medium severity or higher (4.0 and above) go through EventBridge to an SNS topic encrypted with the same key, which emails me a one-line summary. The address is a deploy-time parameter and is never committed.
 - **Access logs, in one bucket per environment.** The ALB, CloudFront (standard logs) and the static bucket all log to a bucket in `logging.yaml`, deployed right after the network, so the other stacks can switch logging on when they are created. Delivery to S3 is free for all three, and storage is $0.023 per GB-month. Logs expire after 30 days in dev and 365 in prod. The bucket uses SSE-S3, because ALB access logs cannot be delivered to a KMS-encrypted bucket. It also keeps ACLs enabled, because CloudFront's free standard logs write objects with an ACL. The newer CloudFront logging avoids ACLs, but it costs $0.25 per GB and has to be configured in us-east-1 after the distribution exists. Only the ELB log delivery account for eu-west-1 and the S3 logging service may write here, each under its own prefix.
 - **WAF logs: blocked and counted requests only.** AWS requires WAF's log destination to be in the web ACL's Region, so the log group is in us-east-1, in `edge-global`. It must be named `aws-waf-logs-*`, has 90-day retention, and is encrypted with its own key ($1 a month). The eu-west-1 logs key cannot be used across Regions. Allowed requests already appear in the ALB and CloudFront logs, so a filter keeps only blocked and counted ones, at $0.57 per GB ingested.
 - **Alarms on what users notice first.** All alarms use the free default metrics, at $0.10 each a month: 11 in dev and 13 in prod.
@@ -182,7 +157,7 @@ At list prices, this adds about **$4.10 a month in dev** and **$5.30 in prod**, 
 
 ### CI/CD and deploy access (`cicd.yaml`, `.github/workflows/`, `scripts/`)
 
-- **No AWS keys in GitHub.** The deploy workflow asks GitHub for an OIDC token, and STS exchanges it for a role session of at most two hours (a first prod deploy waits on RDS Multi-AZ and CloudFront). Each environment's deploy role trusts exactly one subject, `repo:pimentafonso/aws-ha-web-platform:environment:<env>`, with the audience `sts.amazonaws.com`. A fork, another repository, or a job outside that GitHub environment gets nothing. The subjects are stack parameters, so they could be narrowed further (for example to a single branch) without editing the template.
+- **No AWS keys in GitHub.** The deploy workflow asks GitHub for an OIDC token, and STS exchanges it for a role session of at most two hours (a first prod deploy waits on RDS Multi-AZ and CloudFront). Each environment's deploy role trusts exactly one subject, `repo:pimentafonso@350777569/aws-ha-web-platform@1456449290:environment:<env>`, with the audience `sts.amazonaws.com`. That is GitHub's immutable subject format, which this repository uses: it carries the owner and repository IDs, so a repository re-created under the same name gets nothing. My first CI deploy was refused until the roles trusted it. A fork, another repository, or a job outside that GitHub environment gets nothing. The subjects are stack parameters, so they could be narrowed further (for example to a single branch) without editing the template.
 - **One OIDC provider per account, so creating it is optional.** AWS allows one `token.actions.githubusercontent.com` provider per account. `CreateOidcProvider=false` with `ExistingOidcProviderArn` reuses one that already exists. AWS validates GitHub's tokens against its own trusted CAs, so no certificate thumbprint is pinned.
 - **Two roles per environment.** The GitHub deploy role can do very little by itself:
   - create and execute change sets on `<env>-*` stacks, and only together with that environment's CloudFormation execution role (a `cloudformation:RoleArn` condition);
@@ -202,7 +177,7 @@ At list prices, this adds about **$4.10 a month in dev** and **$5.30 in prod**, 
 
 ### Planned
 
-- **CloudFormation over CDK/Terraform:** _TBD_
+- **CloudFormation over CDK or Terraform.** Deploying needs only the AWS CLI. There is no state file to store, lock and protect, because CloudFormation keeps the state. A CloudFormation execution role lets CI deploy without holding the permissions itself (above). Rollback on a failed create or update is built in, and the deploy sessions used it many times. What I give up: YAML is a weaker language than TypeScript or HCL. Choosing a `DeletionPolicy` from a parameter needed the `AWS::LanguageExtensions` transform, which then needed its own IAM permission and broke `--use-previous-template`. Feedback is also slow: a failed RDS create takes 10 minutes or more to roll back.
 
 ## Security
 
@@ -216,7 +191,7 @@ Detail in [SECURITY.md](SECURITY.md). In short:
   - Nothing secret is in a template or in this repository.
 - **Encryption in transit and at rest.** TLS from viewer to CloudFront to the ALB in prod, and to PostgreSQL and Valkey. Customer-managed KMS keys for the data tier, logs and audit trail.
 - **Least-privilege IAM.** Each role allows one job: pull an image, read one secret, or connect as one database user. CI deploys with short-lived OIDC sessions and no stored keys. Everything else goes through a CloudFormation execution role, which can only create roles inside a permissions boundary.
-- **Detection.** CloudTrail in every Region with log file validation, GuardDuty with emailed findings, WAF logs of blocked requests, and access logs for the ALB, CloudFront and S3.
+- **Detection.** CloudTrail in every Region with log file validation, GuardDuty with emailed findings (where the account allows it; my Free plan account does not), WAF logs of blocked requests, and access logs for the ALB, CloudFront and S3.
 
 ## Observability
 
@@ -231,15 +206,38 @@ Alarms and the dashboard are described under [Security and observability](#secur
 | VPC flow logs (prod) | CloudWatch Logs `/aws-ha-web-platform/prod/vpc-flow-logs` |
 | CloudTrail, GuardDuty findings | Audit bucket from the security stack |
 
-_TBD: dashboard screenshot once deployed._
+A dashboard screenshot, with account IDs and the domain removed, will come with the write-up in the next milestone. In prod, the `prod-api-5xx` alarm fired 3 min 20 s after the RDS failover's first error and cleared once the app had recovered; the p95 latency alarm fired too.
 
 ## Reliability testing
 
-_TBD: documented tests for (1) stopping a running task, (2) forcing an RDS Multi-AZ failover, with measured results._
+I ran each test once against prod on 17 November 2026. A k6 script ([`loadtest/latency.js`](loadtest/latency.js)) sent requests through CloudFront from my laptop in Lisbon and recorded every response. Prod ran a Multi-AZ `db.t4g.micro`, not the designed `db.t4g.small`, because of the Free plan. Commands, timelines and logs are in [docs/measurements.md](docs/measurements.md#session-3-prod-and-failover-tests-17-november-2026).
+
+| Failure | How I caused it | Back to normal (AWS's view) | What clients saw |
+|---|---|---|---|
+| One of two Fargate tasks stops | `aws ecs stop-task` | Replacement healthy after 58 s, service steady after 67 s | **0 errors** in 658 requests over the following minute |
+| RDS Multi-AZ failover | `aws rds reboot-db-instance --force-failover` | Failover completed in **29 s** | Database routes failed for **about 6 minutes** (531 of 863 requests in the run); `/health` stayed up |
+| Valkey primary fails over to the replica | `aws elasticache test-failover` | Failover completed in **22 s** | **0 errors** in 687 requests; 34 s of reads served from PostgreSQL instead of the cache |
+
+**The RDS result is the one that matters.** RDS switched to the standby in 29 s. The new primary's IAM authentication service, though, first refused connections, then rejected valid tokens with `403` until about 6 minutes after the failover. Logins waiting on it used up the connection slots. The app recovered without anyone touching it, and `/health` kept the tasks in service, as designed. So IAM database authentication, which I chose to keep passwords out of the service, cost about 6 minutes of errors in a failover. I have tested this once, on a micro instance. Fixing it is first on my list below.
+
+**WAF.** Test 1 sent 10 requests a second, above the rate rule's 1,000 per IP per 5 minutes. WAF started answering `403` after 1,408 requests in 128 s, and its `BlockedRequests` metric matches the 2,337 blocked requests k6 recorded. I had not planned it, but it showed the rule works. The later tests ran at 2 requests a second.
+
+**Latency.** From Lisbon to dev through CloudFront, at a steady 5 requests a second for 2 minutes (17 November 2026, 693 requests, none failed): p50 55 ms, p95 89 ms, p99 110 ms. This measures one client at a low rate, not capacity.
 
 ## Cost
 
-_TBD: measured monthly cost per environment, with the AWS Pricing Calculator link and Cost Explorer figures._
+Everything ran on the AWS Free plan's credits, so nothing could be charged to a card. How long each environment was up, from the first create to the end of the teardown:
+
+| Session | Date | Up for |
+|---|---|---|
+| 1. Dev, deployed from my laptop | 16–17 November 2026 | 62 minutes, plus 6 for a failed first attempt |
+| 2. Dev, deployed by GitHub Actions | 17 November 2026 | about 61 minutes |
+| 3. Prod and failover tests | 17 November 2026 | 2 hours 15 minutes |
+| Account stacks (security, cicd) | since 16 November 2026 | still up, by design |
+
+**Real spend: not known yet.** At 12:56 UTC on 17 November, after all three sessions, the credit balance and both budgets still showed no usage, because AWS billing data lags. I will add the figures from AWS billing once they appear, and not before. I checked the main list prices behind the monthly totals in [Design decisions](#design-decisions-and-trade-offs) against the AWS Price List again on 17 November 2026; they had not changed.
+
+Two cost guards are in place: an AWS Budget of $20 a month that excludes credits (with credits included, a budget stays at $0 and never alerts), and a CloudWatch alarm on estimated charges above $10.
 
 ## Repository layout
 
@@ -265,7 +263,7 @@ docker compose --profile app up --build   # API on http://localhost:3000
 
 ## Deploy and teardown
 
-Nothing has been deployed yet. Deploying needs the AWS CLI v2 and bash 4 or later (Git Bash works on Windows). It also needs Docker with buildx, unless the image is already in ECR.
+Deploying needs the AWS CLI v2 and bash 4 or later (Git Bash works on Windows). It also needs Docker with buildx, unless the image is already in ECR.
 
 ```sh
 bash scripts/lint.sh               # cfn-lint, Checkov (templates and workflows), ShellCheck
@@ -307,6 +305,18 @@ Private values come from the environment, never from files in the repository:
 
 A stack whose first creation failed (`ROLLBACK_COMPLETE`) has to be deleted before it can be deployed again. The script stops and says so.
 
+**Measured times** (CloudFormation stack events and wall clock, November 2026; details in [docs/measurements.md](docs/measurements.md)):
+
+| | Dev | Prod |
+|---|---|---|
+| Data stack create (RDS and Valkey) | 9 min 36 s | 18 min 13 s (Multi-AZ, 2 cache nodes) |
+| Compute create, then update with the service on | 3 min 16 s, then 1 min 44 s | 3 min 38 s, then 1 min 12 s |
+| Edge create (CloudFront) | 3 min 28 s | 3 min 29 s, plus 2 min 38 s for the us-east-1 certificate and WAF |
+| Whole first deploy from GitHub Actions | 22 min 54 s | not run from CI |
+| Teardown | 12 to 16 min | 12 min 47 s for the last run (earlier attempts failed on bugs, since fixed) |
+
+In dev, a redeploy with only an app change took 5 min 34 s, and one with no changes 2 min 9 s.
+
 **Teardown.** `destroy.sh <env>` deletes in reverse order and skips stacks that are not there, so an interrupted teardown can simply be run again. It runs with my own credentials: the GitHub deploy roles cannot delete stacks.
 
 - Prod's ALB and RDS deletion protection is turned off by updating those stacks' parameters, not by calling the services directly, so the stacks never drift from what they manage.
@@ -325,9 +335,9 @@ A stack whose first creation failed (`ROLLBACK_COMPLETE`) has to be deleted befo
 - Both workflows have read-only repository access (`contents: read`); only the deploy job can also request an OIDC token (`id-token: write`). Checkout does not keep the token on disk.
 - Every action is pinned to a full commit SHA, with its version in a comment.
 - A new push to a pull request cancels that pull request's previous CI run. Deploys of the same environment queue rather than overlap, and never cancel one another.
-- Merges to `main` do not deploy anything yet. I will decide whether `main` deploys dev automatically once I have run and timed the deploys by hand.
+- Merges to `main` do not deploy anything. Every deploy creates billable resources, so I start each one by hand.
 
-One-off set-up, to do before the first CI deploy (none of it exists yet):
+One-off set-up before the first CI deploy (done on my account in November 2026):
 
 1. `bash scripts/deploy.sh account` with my own credentials. It creates the OIDC provider, the deploy and execution roles, and the boundary.
 2. In the repository settings:
@@ -339,7 +349,10 @@ One-off set-up, to do before the first CI deploy (none of it exists yet):
 
 ## What I'd do next
 
-_TBD: multi-region active/passive, blue/green deployments with CodeDeploy, EKS variant._
+- **Make a database failover take seconds, not minutes.** Measure RDS Proxy in front of the database (it holds the database connections and can take the IAM sign-ins), and backoff in the app while sign-ins fail. Then repeat the failover test several times, on the designed `db.t4g.small`, to see how much the instance size mattered.
+- **Rotate the Valkey AUTH token automatically.**
+- **GuardDuty, with Runtime Monitoring for Fargate**, on an account plan that allows it, and measure what it costs.
+- **Multi-Region active/passive**, blue/green deployments with CodeDeploy, and an EKS variant.
 
 ## Licence
 

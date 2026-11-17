@@ -10,6 +10,10 @@ ENV NODE_ENV=production
 WORKDIR /app
 
 # CA bundle used to verify the RDS server certificate (DB_SSL_CA_PATH).
+# The directory is created first: ADD --chmod would otherwise also give the
+# directory it creates mode 444, and without the execute bit the file inside
+# cannot be opened.
+RUN mkdir -m 755 /etc/ssl/rds
 ADD --chmod=444 https://truststore.pki.rds.amazonaws.com/eu-west-1/eu-west-1-bundle.pem /etc/ssl/rds/eu-west-1-bundle.pem
 
 COPY --from=deps /app/node_modules ./node_modules

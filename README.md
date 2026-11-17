@@ -2,7 +2,7 @@
 
 A highly available web platform on AWS, defined entirely in CloudFormation, running a small Node.js/Express API on ECS Fargate across two Availability Zones.
 
-> **Status:** deployed, measured and torn down on real AWS in November 2026, in three sessions: dev from my laptop, dev from GitHub Actions, and prod with failover tests. Nothing is running now. Every deploy time, latency and failover figure in this README was measured, and says how and when; the full log, including what went wrong, is in [docs/measurements.md](docs/measurements.md). Real spend is still to come from AWS billing. Prices in [Design decisions](#design-decisions-and-trade-offs) are dated list prices, not measurements.
+> **Status:** deployed, measured and torn down on real AWS in November 2026, in four sessions: dev from my laptop, dev from GitHub Actions, prod with failover tests, and prod again for the dashboard and a second database failover. Nothing is running now. Every deploy time, latency and failover figure in this README was measured, and says how and when; the full log, including what went wrong, is in [docs/measurements.md](docs/measurements.md). Real spend is still to come from AWS billing. Prices in [Design decisions](#design-decisions-and-trade-offs) are dated list prices, not measurements.
 
 ## Contents
 
@@ -206,19 +206,24 @@ Alarms and the dashboard are described under [Security and observability](#secur
 | VPC flow logs (prod) | CloudWatch Logs `/aws-ha-web-platform/prod/vpc-flow-logs` |
 | CloudTrail, GuardDuty findings | Audit bucket from the security stack |
 
-A dashboard screenshot, with account IDs and the domain removed, will come with the write-up in the next milestone. In prod, the `prod-api-5xx` alarm fired 3 min 20 s after the RDS failover's first error and cleared once the app had recovered; the p95 latency alarm fired too.
+A screenshot of the dashboard during a database failover is under [Reliability testing](#reliability-testing), and the story behind it in [docs/write-up.md](docs/write-up.md). In prod, the `prod-api-5xx` alarm fired 3 min 20 s after the RDS failover's first error and cleared once the app had recovered; the p95 latency alarm fired too.
 
 ## Reliability testing
 
-I ran each test once against prod on 17 November 2026. A k6 script ([`loadtest/latency.js`](loadtest/latency.js)) sent requests through CloudFront from my laptop in Lisbon and recorded every response. Prod ran a Multi-AZ `db.t4g.micro`, not the designed `db.t4g.small`, because of the Free plan. Commands, timelines and logs are in [docs/measurements.md](docs/measurements.md#session-3-prod-and-failover-tests-17-november-2026).
+I ran each test against prod on 17 November 2026, and repeated the RDS failover that evening. A k6 script ([`loadtest/latency.js`](loadtest/latency.js)) sent requests through CloudFront from my laptop in Lisbon and recorded every response. Prod ran a Multi-AZ `db.t4g.micro`, not the designed `db.t4g.small`, because of the Free plan. Commands, timelines and logs are in [docs/measurements.md](docs/measurements.md#session-3-prod-and-failover-tests-17-november-2026).
 
 | Failure | How I caused it | Back to normal (AWS's view) | What clients saw |
 |---|---|---|---|
 | One of two Fargate tasks stops | `aws ecs stop-task` | Replacement healthy after 58 s, service steady after 67 s | **0 errors** in 658 requests over the following minute |
 | RDS Multi-AZ failover | `aws rds reboot-db-instance --force-failover` | Failover completed in **29 s** | Database routes failed for **about 6 minutes** (531 of 863 requests in the run); `/health` stayed up |
+| RDS Multi-AZ failover, repeated that evening | the same | Failover completed in **48 s** | Database routes failed for **11 to 14 minutes** (992 of 1,468 requests in the run); `/health` stayed up |
 | Valkey primary fails over to the replica | `aws elasticache test-failover` | Failover completed in **22 s** | **0 errors** in 687 requests; 34 s of reads served from PostgreSQL instead of the cache |
 
-**The RDS result is the one that matters.** RDS switched to the standby in 29 s. The new primary's IAM authentication service, though, first refused connections, then rejected valid tokens with `403` until about 6 minutes after the failover. Logins waiting on it used up the connection slots. The app recovered without anyone touching it, and `/health` kept the tasks in service, as designed. So IAM database authentication, which I chose to keep passwords out of the service, cost about 6 minutes of errors in a failover. I have tested this once, on a micro instance. Fixing it is first on my list below.
+**The RDS result is the one that matters.** RDS switched to the standby in 29 s. The new primary's IAM authentication service, though, first refused connections, then rejected valid tokens with `403` until about 6 minutes after the failover. Logins waiting on it used up the connection slots. The app recovered without anyone touching it, and `/health` kept the tasks in service, as designed. In the second run the same thing happened for 11 to 14 minutes. So IAM database authentication, which I chose to keep passwords out of the service, cost 6 minutes of errors in one failover and at least 11 in the other, and I cannot predict which. Both runs were on a micro instance. Fixing it is first on my list below.
+
+![CloudWatch dashboard during the second forced RDS failover: requests and 5xx errors rising together, p95 and p99 response time at the 10 s timeout, two healthy tasks throughout, database CPU up from about 5% to about 45%](docs/images/dashboard-rds-failover.png)
+
+*The prod dashboard during the second failover, 19:50 to 20:15 UTC, rendered from its widgets with CloudWatch `GetMetricWidgetImage`. The load ran from 19:56 to 20:08, so the drop after 20:08 is the load ending, not the recovery.*
 
 **WAF.** Test 1 sent 10 requests a second, above the rate rule's 1,000 per IP per 5 minutes. WAF started answering `403` after 1,408 requests in 128 s, and its `BlockedRequests` metric matches the 2,337 blocked requests k6 recorded. I had not planned it, but it showed the rule works. The later tests ran at 2 requests a second.
 
@@ -233,6 +238,7 @@ Everything ran on the AWS Free plan's credits, so nothing could be charged to a 
 | 1. Dev, deployed from my laptop | 16–17 November 2026 | 62 minutes, plus 6 for a failed first attempt |
 | 2. Dev, deployed by GitHub Actions | 17 November 2026 | about 61 minutes |
 | 3. Prod and failover tests | 17 November 2026 | 2 hours 15 minutes |
+| 4. Prod for the dashboard and a second RDS failover | 17 November 2026 | 2 hours 37 minutes, over an hour of it waiting for DNS delegation |
 | Account stacks (security, cicd) | since 16 November 2026 | still up, by design |
 
 **Real spend: not known yet.** At 12:56 UTC on 17 November, after all three sessions, the credit balance and both budgets still showed no usage, because AWS billing data lags. I will add the figures from AWS billing once they appear, and not before. I checked the main list prices behind the monthly totals in [Design decisions](#design-decisions-and-trade-offs) against the AWS Price List again on 17 November 2026; they had not changed.

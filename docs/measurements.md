@@ -269,3 +269,41 @@ The leftover check (the same list as session 1, in eu-west-1 and us-east-1, plus
 ### Spend
 
 At 12:48 UTC on 17 November the credit balance still read $179.72 and both budgets $0.00, the same as before sessions 1 and 2. Billing has not caught up with any of the three sessions yet.
+
+## Session 4: prod again, for the dashboard and a second RDS failover, 17 November 2026
+
+Prod deployed from my laptop again, with the same overrides as session 3 (Multi-AZ `db.t4g.micro`, 1 day of backups). Up from 18:04 to 20:41 UTC (2 hours 37 minutes). Most of the extra time over session 3 went on waiting for the DNS delegation.
+
+### What went wrong
+
+- The first run stopped before building the image, because I had an uncommitted file in the working tree (this write-up). The app was unchanged, so I re-ran with `ALLOW_DIRTY=true`.
+- `docker login` to ECR failed with *"The stub received bad data"* on four attempts in a row (Windows Credential Manager's size limit, as in session 3). Retrying did not help this time. I pushed with a temporary `DOCKER_CONFIG` whose `config.json` already had an `auths` entry. That makes Docker skip its default credential store and keep the login in the file. I deleted the directory straight after, because it held the ECR token in plain text.
+- The new hosted zone had new name servers, and the NS records for them were added at Cloudflare about 1 h 10 min after the zone was created, so the stacks that were already up idled until then.
+
+### Deploy
+
+The data stack (Multi-AZ PostgreSQL, two-node Valkey) took about 17 min 45 s (18:09:21 to 18:27:07, from the script's log). Once the delegation resolved, the rest (compute, migration, us-east-1 certificate and WAF, CloudFront, observability) took 950 s by wall clock. `/ready` returned 200 on the first call, in 1.04 s.
+
+### Second RDS Multi-AZ failover
+
+`loadtest/latency.js` with `RATE=2 DURATION=12m --out csv`, and `aws rds reboot-db-instance --force-failover` 75 s in, at 19:57:14 UTC.
+
+RDS events: *failover started* 19:57:29, *DB instance restarted* 19:57:47, *failover completed* 19:58:17, so **48 s**.
+
+The app's database routes failed from **19:57:36 until the end of the k6 run at 20:08:06**: 992 of 1,468 requests (67.6%), 880 of them 500s and 112 `/ready` 503s. `/health` returned 200 throughout (0 of 280 failed), and both tasks stayed healthy. The PostgreSQL log of the new primary shows the same failure as session 3: `pam_authenticate failed: Permission denied` for `notes_app`, the IAM sign-in, from 19:57:44 to 20:08:43 (176 of the underlying `403 Forbidden` lines, and 476 *"too many clients already"*). A request of mine at 20:08:43 still failed. Nothing signed in between then and 20:11:30, when the first request of a probe every 10 s succeeded, and every later one did too.
+
+So this time the app was down for database requests for **between 11 min 14 s and 14 min** after the failover started, against about 6 minutes in session 3, again with nothing changed on my side. Two runs, same cause, very different durations: I cannot predict how long IAM sign-in takes to come back on a new primary, which makes it a bigger problem than one run suggested.
+
+### Dashboard
+
+[`docs/images/dashboard-rds-failover.png`](images/dashboard-rds-failover.png) shows 19:50 to 20:15. I rendered each metric widget of the `prod` dashboard with CloudWatch `GetMetricWidgetImage` and tiled them; the alarm-status widget cannot be rendered that way. The k6 run started at 19:56 and ended at 20:08, so the fall in requests, errors and database CPU after 20:08 is the load stopping, not the recovery. Database CPU went from about 5% before the failover to between 30% and 50% while sign-ins were failing.
+
+### Teardown
+
+`CONFIRM_PROD=yes PURGE_RETAINED=yes bash scripts/destroy.sh prod` succeeded on the first run this time: 1,700 s (20:12:49 to 20:41:09 UTC). It deleted the final snapshot and scheduled the data key for deletion.
+
+The leftover check (the same list as session 3) found nothing billable from this session. It did find two **enabled** prod data keys from session 3, created at 10:34 and 10:46 UTC by the two data-stack attempts the Free plan refused. A stack that rolls back keeps its key, because the key's `DeletionPolicy` follows the database's. My session 3 check missed them, because I only looked for keys pending deletion. Each costs $1 a month, prorated. Nothing was encrypted with them any more, so I scheduled both for deletion in 7 days.
+
+### Spend
+
+At 20:46 UTC on 17 November the credit balance read $178.79. It had read $179.72 from session 0 until after session 3, and $179.54 at 17:10 UTC before this session. Billing is catching up, but the figures are still incomplete, so I am not reporting a per-session cost yet.

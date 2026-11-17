@@ -21,9 +21,19 @@ if (!BASE_URL) throw new Error('set BASE_URL, e.g. -e BASE_URL=https://dxxxxxxxx
 const RATE = Number(__ENV.RATE || 5);
 const DURATION = __ENV.DURATION || '2m';
 const SEED_NOTES = 10;
-const JSON_HEADERS = { headers: { 'Content-Type': 'application/json' } };
+const JSON_TYPE = { 'Content-Type': 'application/json' };
+// k6 0.43's JavaScript runtime has no object spread or Object.fromEntries.
+const jsonParams = (name) => ({ headers: JSON_TYPE, tags: { name } });
 
 const ROUTES = ['health', 'ready', 'get_note', 'list_notes', 'create_delete'];
+
+function routeThresholds() {
+  const t = { http_req_failed: ['rate<0.01'] };
+  ROUTES.forEach((r) => {
+    t[`http_req_duration{name:${r}}`] = ['p(99)<5000'];
+  });
+  return t;
+}
 
 export const options = {
   scenarios: {
@@ -39,10 +49,7 @@ export const options = {
   summaryTrendStats: ['min', 'med', 'p(95)', 'p(99)', 'max', 'count'],
   // Thresholds only make the per-route numbers show up in the summary; they
   // are loose on purpose and are not a service-level objective.
-  thresholds: Object.fromEntries([
-    ['http_req_failed', ['rate<0.01']],
-    ...ROUTES.map((r) => [`http_req_duration{name:${r}}`, ['p(99)<5000']]),
-  ]),
+  thresholds: routeThresholds(),
 };
 
 export function setup() {
@@ -51,7 +58,7 @@ export function setup() {
     const res = http.post(
       `${BASE_URL}/api/notes`,
       JSON.stringify({ title: `k6 seed ${i}`, content: 'latency probe' }),
-      { ...JSON_HEADERS, tags: { name: 'setup' } },
+      jsonParams('setup'),
     );
     if (res.status !== 201) throw new Error(`setup: POST /api/notes returned ${res.status}`);
     ids.push(res.json('id'));
@@ -83,7 +90,7 @@ export default function (data) {
     const created = http.post(
       `${BASE_URL}/api/notes`,
       JSON.stringify({ title: 'k6 write', content: 'created and deleted' }),
-      { ...JSON_HEADERS, tags: { name: 'create_delete' } },
+      jsonParams('create_delete'),
     );
     check(created, { 'create 201': (r) => r.status === 201 });
     if (created.status === 201) {

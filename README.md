@@ -36,7 +36,7 @@ The API itself is deliberately small, so the focus stays on the infrastructure a
 | `GET /ready` | Readiness: checks PostgreSQL (required) and Redis (optional). Returns 503 if the database is unreachable. |
 | `POST /api/notes` | Create a note (`title`, optional `content`). |
 | `GET /api/notes` | List recent notes (`?limit=`, max 100). |
-| `GET /api/notes/:id` | Read a note through the cache. The `X-Cache: HIT|MISS` header shows which path served it. |
+| `GET /api/notes/:id` | Read a note through the cache. The `X-App-Cache: HIT|MISS` header shows which path served it. (Not `X-Cache`: CloudFront sets its own `X-Cache` and replaces the origin's.) |
 | `DELETE /api/notes/:id` | Delete a note and invalidate its cache entry. |
 
 Behaviours that matter for the platform:

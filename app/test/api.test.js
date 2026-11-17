@@ -64,9 +64,9 @@ describe('with database and cache', () => {
     assert.equal(created.headers.location, `/api/notes/${created.body.id}`);
 
     const first = await request(app).get(`/api/notes/${created.body.id}`).expect(200);
-    assert.equal(first.headers['x-cache'], 'MISS');
+    assert.equal(first.headers['x-app-cache'], 'MISS');
     const second = await request(app).get(`/api/notes/${created.body.id}`).expect(200);
-    assert.equal(second.headers['x-cache'], 'HIT');
+    assert.equal(second.headers['x-app-cache'], 'HIT');
     assert.deepEqual(second.body, first.body);
 
     const list = await request(app).get('/api/notes').expect(200);
@@ -113,7 +113,7 @@ describe('when the cache is unavailable', () => {
   test('reads and writes still succeed from the database', async () => {
     const created = await request(app).post('/api/notes').send({ title: 'No cache' }).expect(201);
     const res = await request(app).get(`/api/notes/${created.body.id}`).expect(200);
-    assert.equal(res.headers['x-cache'], 'MISS');
+    assert.equal(res.headers['x-app-cache'], 'MISS');
   });
 
   test('/ready stays 200 and reports the cache as down', async () => {

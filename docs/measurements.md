@@ -130,3 +130,48 @@ The deploy also answered one open question: `aws cloudformation deploy` accepts 
 ### Spend
 
 At 00:55 UTC on 17 November the Free plan credit balance still read $179.72 (`aws freetier get-account-plan-state`), and the budget's actual spend $0.00. Billing data lags by hours, so the real figure for this session is still to come.
+
+## Session 2: dev deployed by GitHub Actions, 17 November 2026
+
+`deploy.yml`, dispatched on `main` for `dev`. It runs on the `ubuntu-24.04-arm` runner, assumes the dev deploy role through GitHub OIDC, and runs `deploy.sh dev` with `USE_EXEC_ROLE=true`, so CloudFormation acts as the dev execution role inside the workload permissions boundary. Teardown ran from my laptop with my own credentials. Dev was up from about 01:30 to 02:31 UTC; the network and logging stacks came up first, and the rest from about 01:50.
+
+### What the first CI runs found
+
+Four runs failed before one succeeded. Each fix went into the `cicd` stack (deployed with my own credentials) and was committed:
+
+1. **OIDC subject.** GitHub issues this repository immutable subjects, which carry the owner and repository IDs: `repo:pimentafonso@350777569/aws-ha-web-platform@1456449290:environment:dev`. `GET /repos/<owner>/<repo>/actions/oidc/customization/sub` shows `use_immutable_subject: true`. The roles trusted the older `repo:pimentafonso/aws-ha-web-platform:...` form, so `AssumeRoleWithWebIdentity` was refused. The roles now trust the immutable form, which also stops a repository or account re-created under the same name from assuming them.
+2. **LanguageExtensions transform.** CloudFormation expands the data stack's `AWS::LanguageExtensions` transform as the stack's service role. I had allowed `cloudformation:CreateChangeSet` on the transform for the deploy role only, so the execution role was refused.
+3. **PassRole for Enhanced Monitoring.** RDS passes the monitoring role itself, inside `CreateDBInstance`, so `iam:PassedToService` is `rds.amazonaws.com`, not `monitoring.rds.amazonaws.com`.
+
+This answers two open questions from M3. The deploy and execution roles did not have every permission CloudFormation needs; items 2 and 3 were missing. And the `ubuntu-24.04-arm` runner image includes the AWS CLI (2.40.0 on this run).
+
+Public log check: the account ID appears as `***` throughout, including in the role ARN and the ECR host, because it is passed as a secret. A search of the full run log for 12-digit account numbers in ARNs or ECR hosts found none.
+
+### Successful run
+
+[Run 43998407149](https://github.com/pimentafonso/aws-ha-web-platform/actions/runs/43998407149), 01:49:01 to 02:11:55 UTC, 22 min 54 s. The network and logging stacks already existed from the failed runs, so they reported no changes. Step times from the timestamps in the run log:
+
+| Step | Time |
+| --- | --- |
+| `dev-data` (create) | 10 min 15 s |
+| `dev-registry` (create) | 39 s |
+| arm64 image build and push, natively on the arm64 runner | 19 s |
+| `dev-compute` (create, service off) | 3 min 43 s |
+| Migration task | 48 s |
+| `dev-compute` (update, service on) | 1 min 44 s |
+| `dev-edge` (create) | 4 min 12 s |
+| `dev-observability` (create) | 37 s |
+
+### Smoke test
+
+The same checks as session 1, all passing, with one repeat: the first `/ready` after the deploy again returned **503 after 5.3 s**, and the next one 200 in 1.4 s. So the slow first database connection reproduces. A likely cause is that the first `getAuthToken()` also fetches the task role's credentials from the ECS credentials endpoint, on top of the first IAM-authenticated login. I have not confirmed this.
+
+### Teardown
+
+The first `destroy.sh dev` run failed after 263 s. CloudFormation could not delete the CloudFront distribution: *"The distribution you are trying to delete has not been disabled"*. I had started the teardown about a minute after the deploy finished. The stack had disabled the distribution at 02:14:32, but the delete at 02:17:25 still saw it enabled. Re-running a minute later succeeded: 717 s. `destroy.sh` now waits for the distribution to finish deploying and retries, up to three times. It also removes the `RDSOSMetrics` log group once no database is left, which I had deleted by hand twice.
+
+The leftover check came back clean, the same as session 1. What remains: the account stacks, the audit bucket, and three dev data keys pending deletion, which are not billed (one each from session 1, the rolled-back attempt and this session).
+
+### Spend
+
+At 02:33 UTC on 17 November the credit balance still read $179.72, and the budget's actual spend $0.00. Billing has not caught up with either session yet.

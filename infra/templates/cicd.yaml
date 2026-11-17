@@ -16,9 +16,14 @@ Metadata:
 Parameters:
   GitHubRepository:
     Type: String
-    Default: pimentafonso/aws-ha-web-platform
-    AllowedPattern: ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$
-    Description: owner/repository whose workflows may assume the deploy roles.
+    Default: pimentafonso@350777569/aws-ha-web-platform@1456449290
+    AllowedPattern: ^[A-Za-z0-9-]+(@[0-9]+)?/[A-Za-z0-9._-]+(@[0-9]+)?$
+    Description: >-
+      Repository part of the OIDC sub claim. With GitHub's immutable subjects
+      (GET /repos/<owner>/<repo>/actions/oidc/customization/sub shows
+      use_immutable_subject) it is owner@owner_id/repo@repo_id, so a repository
+      or account re-created under the same name cannot assume the roles.
+      Otherwise plain owner/repo.
 
   DevSubject:
     Type: String

@@ -1,5 +1,5 @@
 [
-  { "ParameterKey": "GitHubRepository", "ParameterValue": "pimentafonso/aws-ha-web-platform" },
+  { "ParameterKey": "GitHubRepository", "ParameterValue": "pimentafonso@350777569/aws-ha-web-platform@1456449290" },
   { "ParameterKey": "DevSubject", "ParameterValue": "environment:dev" },
   { "ParameterKey": "ProdSubject", "ParameterValue": "environment:prod" },
   { "ParameterKey": "CreateOidcProvider", "ParameterValue": "true" }

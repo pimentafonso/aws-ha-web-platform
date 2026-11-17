@@ -16,9 +16,14 @@ Metadata:
 Parameters:
   GitHubRepository:
     Type: String
-    Default: pimentafonso/aws-ha-web-platform
-    AllowedPattern: ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$
-    Description: owner/repository whose workflows may assume the deploy roles.
+    Default: pimentafonso@350777569/aws-ha-web-platform@1456449290
+    AllowedPattern: ^[A-Za-z0-9-]+(@[0-9]+)?/[A-Za-z0-9._-]+(@[0-9]+)?$
+    Description: >-
+      Repository part of the OIDC sub claim. With GitHub's immutable subjects
+      (GET /repos/<owner>/<repo>/actions/oidc/customization/sub shows
+      use_immutable_subject) it is owner@owner_id/repo@repo_id, so a repository
+      or account re-created under the same name cannot assume the roles.
+      Otherwise plain owner/repo.
 
   DevSubject:
     Type: String
@@ -214,6 +219,13 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:RequestedRegion: [eu-west-1, us-east-1]
+              # CloudFormation expands the data stack's AWS::LanguageExtensions
+              # transform as the stack's service role, so this role needs it
+              # too, not only the deploy role that starts the change set.
+              - Sid: LanguageExtensionsTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:aws:transform/LanguageExtensions
               - Sid: CreateBoundedRoles
                 Effect: Allow
                 Action:
@@ -252,6 +264,7 @@ Resources:
                       - ec2.amazonaws.com
                       - ecs-tasks.amazonaws.com
                       - monitoring.rds.amazonaws.com
+                      - rds.amazonaws.com # RDS passes the Enhanced Monitoring role itself, in CreateDBInstance
                       - vpc-flow-logs.amazonaws.com
               - Sid: OwnInstanceProfiles
                 Effect: Allow
@@ -481,6 +494,13 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:RequestedRegion: [eu-west-1, us-east-1]
+              # CloudFormation expands the data stack's AWS::LanguageExtensions
+              # transform as the stack's service role, so this role needs it
+              # too, not only the deploy role that starts the change set.
+              - Sid: LanguageExtensionsTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:*:aws:transform/LanguageExtensions
               - Sid: CreateBoundedRoles
                 Effect: Allow
                 Action:
@@ -519,6 +539,7 @@ Resources:
                       - ec2.amazonaws.com
                       - ecs-tasks.amazonaws.com
                       - monitoring.rds.amazonaws.com
+                      - rds.amazonaws.com # RDS passes the Enhanced Monitoring role itself, in CreateDBInstance
                       - vpc-flow-logs.amazonaws.com
               - Sid: OwnInstanceProfiles
                 Effect: Allow

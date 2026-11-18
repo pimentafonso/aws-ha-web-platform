@@ -141,15 +141,15 @@ Parameters:
     AllowedPattern: ^[a-z_][a-z0-9_]{0,62}$
     Description: Database user the service connects as with IAM authentication.
 
-  DbProxy:
+  DbAppAuth:
     Type: String
-    Default: "false"
-    AllowedValues: ["true", "false"]
+    Default: iam
+    AllowedValues: [iam, password, proxy]
     Description: >-
-      Must match the data stack's DbProxy. true = the migration task also sets
-      the app user's password (read from the data stack's secret), which RDS
-      Proxy uses to sign in to PostgreSQL. The service's endpoint and IAM
-      policy come from the data stack's exports either way.
+      Must match the data stack's DbAppAuth. password or proxy = the migration
+      task sets the app user's password from the data stack's secret.
+      password = the service signs in with it (ECS injects it); iam or proxy =
+      the service signs in with IAM tokens, to the instance or to RDS Proxy.
 
   ContainerInsights:
     Type: String
@@ -187,7 +187,8 @@ Conditions:
   HasCertificate: !Not [!Equals [!Ref DnsStackName, ""]]
   ServiceOn: !Equals [!Ref ServiceEnabled, "true"]
   HasMigrationImageTag: !Not [!Equals [!Ref MigrationImageTag, ""]]
-  UseProxy: !Equals [!Ref DbProxy, "true"]
+  AppUserPassword: !Not [!Equals [!Ref DbAppAuth, iam]]
+  ServicePassword: !Equals [!Ref DbAppAuth, password]
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -444,8 +445,14 @@ Resources:
               - Sid: CacheToken
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !ImportValue
-                  Fn::Sub: ${DataStackName}-CacheAuthSecretArn
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: ${DataStackName}-CacheAuthSecretArn
+                  - !If
+                    - ServicePassword
+                    - !ImportValue
+                      Fn::Sub: ${DataStackName}-AppDbUserSecretArn
+                    - !Ref AWS::NoValue
               - Sid: DecryptSecretsOnly
                 Effect: Allow
                 Action: kms:Decrypt
@@ -497,7 +504,7 @@ Resources:
                   - !ImportValue
                     Fn::Sub: ${DataStackName}-DbSecretArn
                   - !If
-                    - UseProxy
+                    - AppUserPassword
                     - !ImportValue
                       Fn::Sub: ${DataStackName}-AppDbUserSecretArn
                     - !Ref AWS::NoValue
@@ -603,7 +610,7 @@ Resources:
               Value: !ImportValue
                 Fn::Sub: ${DataStackName}-DbName
             - { Name: DB_USER, Value: !Ref DbAppUser }
-            - { Name: DB_AUTH, Value: iam }
+            - { Name: DB_AUTH, Value: !If [ServicePassword, password, iam] }
             - { Name: DB_SSL_CA_PATH, Value: /etc/ssl/rds/eu-west-1-bundle.pem }
             - { Name: MIGRATE_ON_START, Value: "false" }
             - Name: REDIS_URL
@@ -617,6 +624,14 @@ Resources:
             - Name: REDIS_PASSWORD
               ValueFrom: !ImportValue
                 Fn::Sub: ${DataStackName}-CacheAuthSecretArn
+            - !If
+              - ServicePassword
+              - Name: DB_PASSWORD
+                ValueFrom: !Sub
+                  - "${SecretArn}:password::"
+                  - SecretArn: !ImportValue
+                      Fn::Sub: ${DataStackName}-AppDbUserSecretArn
+              - !Ref AWS::NoValue
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -678,7 +693,7 @@ Resources:
                 - SecretArn: !ImportValue
                     Fn::Sub: ${DataStackName}-DbSecretArn
             - !If
-              - UseProxy
+              - AppUserPassword
               - Name: DB_APP_PASSWORD
                 ValueFrom: !Sub
                   - "${SecretArn}:password::"

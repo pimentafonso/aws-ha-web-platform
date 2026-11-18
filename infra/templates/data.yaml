@@ -26,7 +26,7 @@ Metadata:
           - DbPerformanceInsights
           - DbName
           - DbMasterUsername
-          - DbProxy
+          - DbAppAuth
           - DbAppUser
       - Label: { default: Valkey }
         Parameters: [CacheNodeType, CacheNodeCount, CacheSnapshotRetentionDays]
@@ -106,16 +106,18 @@ Parameters:
     Description: >-
       Master user name. The password is generated and rotated by RDS in
       Secrets Manager and never appears in this template.
-  DbProxy:
+  DbAppAuth:
     Type: String
-    Default: "false"
-    AllowedValues: ["true", "false"]
+    Default: iam
+    AllowedValues: [iam, password, proxy]
     Description: >-
-      true = put RDS Proxy in front of the database. The service then signs in
-      to the proxy with IAM, and the proxy signs in to PostgreSQL with a
-      password it reads from Secrets Manager, so a Multi-AZ failover no longer
-      waits for IAM authentication on the new primary. Billed per vCPU of the
-      instance ($0.016 per vCPU-hour in eu-west-1, November 2026).
+      How the service signs in to PostgreSQL. iam = IAM tokens straight to the
+      instance (no password anywhere, but in two forced Multi-AZ failovers the
+      new primary refused IAM sign-in for 6 and 11-14 minutes). password = a
+      generated password that ECS injects from Secrets Manager. proxy = IAM
+      tokens to RDS Proxy, which signs in to PostgreSQL with that password
+      ($0.016 per vCPU-hour in eu-west-1, November 2026; the AWS Free plan
+      refuses it).
   DbAppUser:
     Type: String
     Default: notes_app
@@ -164,7 +166,8 @@ Conditions:
   MultiAz: !Equals [!Ref DbMultiAz, "true"]
   PerformanceInsights: !Equals [!Ref DbPerformanceInsights, "true"]
   CacheReplica: !Equals [!Ref CacheNodeCount, 2]
-  UseProxy: !Equals [!Ref DbProxy, "true"]
+  UseProxy: !Equals [!Ref DbAppAuth, proxy]
+  AppUserPassword: !Not [!Equals [!Ref DbAppAuth, iam]]
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -419,7 +422,8 @@ Resources:
   # replica in the other AZ that ElastiCache promotes if the primary fails.
   # ---------------------------------------------------------------------------
   # ---------------------------------------------------------------------------
-  # RDS Proxy (optional, DbProxy=true). Clients sign in to the proxy with IAM
+  # App user password (DbAppAuth password or proxy) and RDS Proxy (proxy).
+  # Through the proxy, clients sign in with IAM
   # (IAMAuth REQUIRED, TLS required), and the proxy signs in to PostgreSQL as
   # the app user with a password from Secrets Manager. In two forced Multi-AZ
   # failovers without it, IAM sign-in on the new primary failed for 6 and
@@ -429,18 +433,19 @@ Resources:
   # ---------------------------------------------------------------------------
   AppDbUserSecret:
     Type: AWS::SecretsManager::Secret
-    Condition: UseProxy
+    Condition: AppUserPassword
     Metadata:
       checkov:
         skip:
           - id: CKV2_AWS_57
             comment: >-
-              Not rotated automatically yet: the proxy and the migration task
-              read it, nothing else. Rotation is listed under the README's next
-              steps, with the Valkey token's.
+              Not rotated automatically yet: the migration task and either the
+              proxy or the service's execution role read it, nothing else.
+              Rotation is listed under the README's next steps, with the Valkey
+              token's.
     Properties:
       Name: !Sub aws-ha-web-platform/${EnvironmentName}/db-app-user
-      Description: !Sub ${EnvironmentName} PostgreSQL password for ${DbAppUser}, used only by RDS Proxy
+      Description: !Sub ${EnvironmentName} PostgreSQL password for ${DbAppUser}
       KmsKeyId: !Ref DataKey
       GenerateSecretString:
         SecretStringTemplate: !Sub '{"username": "${DbAppUser}"}'
@@ -621,22 +626,22 @@ Outputs:
     Export: { Name: !Sub "${AWS::StackName}-DbEndpoint" }
   DbConnectEndpoint:
     Description: >-
-      Where the service connects: the proxy endpoint with DbProxy=true, else
-      the instance endpoint.
+      Where the service connects: the proxy endpoint with DbAppAuth=proxy,
+      else the instance endpoint.
     Value: !If [UseProxy, !GetAtt PostgresProxy.Endpoint, !GetAtt Database.Endpoint.Address]
     Export: { Name: !Sub "${AWS::StackName}-DbConnectEndpoint" }
   DbConnectResourceId:
     Description: >-
       Resource id for the service's rds-db:connect policy: the proxy's prx-...
-      id with DbProxy=true, else the instance's DbiResourceId.
+      id with DbAppAuth=proxy, else the instance's DbiResourceId.
     Value: !If
       - UseProxy
       - !Select [6, !Split [":", !GetAtt PostgresProxy.DBProxyArn]]
       - !GetAtt Database.DbiResourceId
     Export: { Name: !Sub "${AWS::StackName}-DbConnectResourceId" }
   AppDbUserSecretArn:
-    Description: The app user's password secret (DbProxy=true), else "none".
-    Value: !If [UseProxy, !Ref AppDbUserSecret, none]
+    Description: The app user's password secret (DbAppAuth password or proxy), else "none".
+    Value: !If [AppUserPassword, !Ref AppDbUserSecret, none]
     Export: { Name: !Sub "${AWS::StackName}-AppDbUserSecretArn" }
   DbPort:
     Value: !GetAtt Database.Endpoint.Port

@@ -11,5 +11,5 @@
   { "ParameterKey": "CacheNodeType", "ParameterValue": "cache.t4g.micro" },
   { "ParameterKey": "CacheNodeCount", "ParameterValue": "2" },
   { "ParameterKey": "CacheSnapshotRetentionDays", "ParameterValue": "1" },
-  { "ParameterKey": "DbProxy", "ParameterValue": "true" }
+  { "ParameterKey": "DbAppAuth", "ParameterValue": "proxy" }
 ]

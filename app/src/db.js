@@ -1,5 +1,6 @@
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
+import tls from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { Signer } from '@aws-sdk/rds-signer';
 import pg from 'pg';
@@ -10,8 +11,11 @@ const MIGRATIONS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '
 const MIGRATION_LOCK_ID = 7_310_442;
 
 export async function createPool(dbConfig) {
+  // The RDS CA bundle verifies the database instance. RDS Proxy presents an
+  // ACM certificate from Amazon's public root CAs instead, so Node's built-in
+  // roots are trusted as well. The host name is verified either way.
   const ssl = dbConfig.sslCaPath
-    ? { rejectUnauthorized: true, ca: await readFile(dbConfig.sslCaPath, 'utf8') }
+    ? { rejectUnauthorized: true, ca: [await readFile(dbConfig.sslCaPath, 'utf8'), ...tls.rootCertificates] }
     : false;
 
   return new pg.Pool({
@@ -44,9 +48,14 @@ const IDENTIFIER_RE = /^[a-z_][a-z0-9_]{0,62}$/;
 // only what the API uses: read and write rows in the existing and future
 // tables of the public schema. It cannot create, alter or drop anything, and
 // cannot read the migration history. On RDS the role is also granted
-// rds_iam, so it logs in with IAM tokens instead of a password. Run by the
-// migration task as the database owner; safe to run repeatedly.
-export async function ensureAppUser(pool, username, logger) {
+// rds_iam, so it logs in with IAM tokens instead of a password.
+//
+// With a password (RDS Proxy in front of the database), the role gets that
+// password and loses rds_iam: the proxy checks the service's IAM token
+// itself and signs in to PostgreSQL with the password, and AWS advises
+// against mixing the two on one role. Without one, any password is removed.
+// Run by the migration task as the database owner; safe to run repeatedly.
+export async function ensureAppUser(pool, username, logger, password) {
   if (!IDENTIFIER_RE.test(username)) throw new Error(`invalid database user name: ${username}`);
   const client = await pool.connect();
   try {
@@ -54,7 +63,14 @@ export async function ensureAppUser(pool, username, logger) {
     const { rowCount } = await client.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [username]);
     if (rowCount === 0) await client.query(`CREATE ROLE ${username} LOGIN`);
     const iam = await client.query("SELECT 1 FROM pg_roles WHERE rolname = 'rds_iam'");
-    if (iam.rowCount === 1) await client.query(`GRANT rds_iam TO ${username}`);
+    const useIam = iam.rowCount === 1 && !password;
+    if (password) {
+      await client.query(`ALTER ROLE ${username} PASSWORD ${client.escapeLiteral(password)}`);
+      if (iam.rowCount === 1) await client.query(`REVOKE rds_iam FROM ${username}`);
+    } else {
+      await client.query(`ALTER ROLE ${username} PASSWORD NULL`);
+      if (useIam) await client.query(`GRANT rds_iam TO ${username}`);
+    }
     const { rows } = await client.query('SELECT current_database() AS db');
     await client.query(`GRANT CONNECT ON DATABASE "${rows[0].db}" TO ${username}`);
     await client.query(`GRANT USAGE ON SCHEMA public TO ${username}`);
@@ -64,7 +80,7 @@ export async function ensureAppUser(pool, username, logger) {
     );
     await client.query(`REVOKE ALL ON schema_migrations FROM ${username}`);
     await client.query('COMMIT');
-    logger.info({ user: username, rdsIam: iam.rowCount === 1 }, 'application database user ready');
+    logger.info({ user: username, rdsIam: useIam, password: Boolean(password) }, 'application database user ready');
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;

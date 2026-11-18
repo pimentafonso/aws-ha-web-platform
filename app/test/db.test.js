@@ -47,6 +47,16 @@ describe('application database user', () => {
     assert.equal(await privilege('SELECT has_schema_privilege($1, $2, $3) AS ok', appUser, 'public', 'CREATE'), false);
   });
 
+  test('sets a password for RDS Proxy, and removes it again without one', async () => {
+    const hasPassword = async () =>
+      (await pool.query('SELECT rolpassword IS NOT NULL AS ok FROM pg_authid WHERE rolname = $1', [appUser])).rows[0]
+        .ok;
+    await ensureAppUser(pool, appUser, logger, "s3cret'with quote");
+    assert.equal(await hasPassword(), true);
+    await ensureAppUser(pool, appUser, logger);
+    assert.equal(await hasPassword(), false);
+  });
+
   test('rejects names that are not plain identifiers', async () => {
     await assert.rejects(ensureAppUser(pool, 'x; DROP TABLE notes', logger), /invalid database user name/);
   });

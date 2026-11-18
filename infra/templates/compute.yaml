@@ -141,6 +141,16 @@ Parameters:
     AllowedPattern: ^[a-z_][a-z0-9_]{0,62}$
     Description: Database user the service connects as with IAM authentication.
 
+  DbProxy:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Must match the data stack's DbProxy. true = the migration task also sets
+      the app user's password (read from the data stack's secret), which RDS
+      Proxy uses to sign in to PostgreSQL. The service's endpoint and IAM
+      policy come from the data stack's exports either way.
+
   ContainerInsights:
     Type: String
     AllowedValues: [enabled, disabled]
@@ -177,6 +187,7 @@ Conditions:
   HasCertificate: !Not [!Equals [!Ref DnsStackName, ""]]
   ServiceOn: !Equals [!Ref ServiceEnabled, "true"]
   HasMigrationImageTag: !Not [!Equals [!Ref MigrationImageTag, ""]]
+  UseProxy: !Equals [!Ref DbProxy, "true"]
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -479,11 +490,17 @@ Resources:
                 Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AppLogGroup}:log-stream:*" # GetAtt Arn already ends in :*
-              - Sid: DatabaseMasterSecret
+              - Sid: DatabaseSecrets
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !ImportValue
-                  Fn::Sub: ${DataStackName}-DbSecretArn
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: ${DataStackName}-DbSecretArn
+                  - !If
+                    - UseProxy
+                    - !ImportValue
+                      Fn::Sub: ${DataStackName}-AppDbUserSecretArn
+                    - !Ref AWS::NoValue
               - Sid: DecryptSecretsOnly
                 Effect: Allow
                 Action: kms:Decrypt
@@ -522,7 +539,7 @@ Resources:
                 Resource: !Sub
                   - arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbAppUser}
                   - DbResourceId: !ImportValue
-                      Fn::Sub: ${DataStackName}-DbResourceId
+                      Fn::Sub: ${DataStackName}-DbConnectResourceId
       Tags:
         - { Key: Environment, Value: !Ref EnvironmentName }
         - { Key: Project, Value: aws-ha-web-platform }
@@ -578,7 +595,7 @@ Resources:
             - { Name: AWS_REGION, Value: !Ref AWS::Region }
             - Name: DB_HOST
               Value: !ImportValue
-                Fn::Sub: ${DataStackName}-DbEndpoint
+                Fn::Sub: ${DataStackName}-DbConnectEndpoint
             - Name: DB_PORT
               Value: !ImportValue
                 Fn::Sub: ${DataStackName}-DbPort
@@ -660,6 +677,14 @@ Resources:
                 - "${SecretArn}:password::"
                 - SecretArn: !ImportValue
                     Fn::Sub: ${DataStackName}-DbSecretArn
+            - !If
+              - UseProxy
+              - Name: DB_APP_PASSWORD
+                ValueFrom: !Sub
+                  - "${SecretArn}:password::"
+                  - SecretArn: !ImportValue
+                      Fn::Sub: ${DataStackName}-AppDbUserSecretArn
+              - !Ref AWS::NoValue
           LogConfiguration:
             LogDriver: awslogs
             Options:

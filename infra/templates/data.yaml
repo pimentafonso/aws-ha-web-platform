@@ -455,7 +455,6 @@ Resources:
     Type: AWS::IAM::Role
     Condition: UseProxy
     Properties:
-      RoleName: !Sub ${EnvironmentName}-db-proxy
       Description: Lets RDS Proxy read the app user's database password, and nothing else
       PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       AssumeRolePolicyDocument:

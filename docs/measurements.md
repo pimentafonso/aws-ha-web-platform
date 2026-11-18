@@ -307,3 +307,44 @@ The leftover check (the same list as session 3) found nothing billable from this
 ### Spend
 
 At 20:46 UTC on 17 November the credit balance read $178.79. It had read $179.72 from session 0 until after session 3, and $179.54 at 17:10 UTC before this session. Billing is catching up, but the figures are still incomplete, so I am not reporting a per-session cost yet.
+
+## Session 5: fixing the database failover, 18 November 2026
+
+Both prod failovers broke on IAM database authentication on the new primary (sessions 3 and 4). This session tested a fix on dev, deployed as a Multi-AZ `db.t4g.micro` to match prod's database: `DB_MULTI_AZ=true`. Dev was up from 15:55 to 17:20 UTC.
+
+### RDS Proxy: refused by the Free plan
+
+The first fix I wrote put RDS Proxy in front of the database. The service signs in to the proxy with IAM, and the proxy signs in to PostgreSQL with a password from Secrets Manager, so IAM sign-in on the instance is out of the path. Creating the proxy failed:
+
+> This feature isn't available with free plan accounts. To remove all limitations, upgrade your account plan.
+
+The data stack rolled back and I deleted it. The proxy stays in the templates as `DbAppAuth=proxy`, written and linted but not deployed. Prod's parameter files select it, as the design for an account that allows it. On this account prod deploys with `DB_APP_AUTH=password`, like the other Free plan overrides.
+
+### The fix I measured: password sign-in
+
+With `DbAppAuth=password`, the data stack generates a password for `notes_app` in Secrets Manager (encrypted with the data key). The migration task sets it on the role and revokes `rds_iam`. ECS injects it into the service as `DB_PASSWORD`, as it does the Valkey token. Only the service's execution role and the migration task can read it.
+
+```
+DB_MULTI_AZ=true DB_APP_AUTH=password ALERT_EMAIL=... bash scripts/deploy.sh dev
+```
+
+The deploy took 1,776 s (16:13 to 16:42 UTC), the data stack about 17 minutes of that. `/health`, `/ready` and `/api/notes` returned 200 straight away.
+
+### Two forced failovers
+
+Each run: `loadtest/latency.js` at 2 requests a second for 10 minutes with `--out csv`, and `aws rds reboot-db-instance --force-failover` 75 s in. Dev runs one task, so the task tier was not part of this test; the failure being tested is in the database tier, which matched prod's apart from the sign-in.
+
+| Run | RDS: failover started to completed | App errors | Failed requests |
+| --- | --- | --- | --- |
+| 1 (16:44 UTC) | 16:44:25 to 16:45:00, **35 s** | 16:44:33 to 16:44:56, **23 s** | 17 of 1,336 |
+| 2 (16:54 UTC) | 16:54:45 to 16:55:30, **45 s** | 16:54:51 to 16:55:13, **22 s** | 17 of 1,332 |
+
+In run 1 the app logged `connect ECONNREFUSED` to the old primary's address while the endpoint's DNS moved, and a few connection timeouts; no sign-in failed. Run 2 had 12 more failed requests at 17:00:25-26, five minutes after recovery: *"An established connection was aborted"* and then *"no such host"* from my laptop's own network and DNS, including two `/health` requests, which never touch the database. I left them out of the error window above.
+
+During run 2, RDS also logged: *"A database workload is causing the system to run critically low on memory. To help mitigate the issue, RDS automatically set the value of shared_buffers from 23081 to 11295."* That is the `db.t4g.micro` the Free plan forces, with 1 GiB of memory.
+
+So on the same database, switching the service from IAM to password sign-in took the app's errors after a forced failover from 6 and 11-14 minutes (prod, sessions 3 and 4) to 23 and 22 seconds (dev, this session).
+
+### Teardown
+
+`bash scripts/destroy.sh dev`: 986 s (17:03:53 to 17:20:19 UTC). Dev was up for 1 h 25 min in all (15:55 to 17:20 UTC). The leftover check (the same list as session 3, plus RDS Proxy) found nothing billable from this project: only the account stacks, the audit bucket and its key.

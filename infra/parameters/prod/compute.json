@@ -12,5 +12,6 @@
   { "ParameterKey": "MinTasks", "ParameterValue": "2" },
   { "ParameterKey": "MaxTasks", "ParameterValue": "4" },
   { "ParameterKey": "ContainerInsights", "ParameterValue": "disabled" },
-  { "ParameterKey": "LogRetentionDays", "ParameterValue": "365" }
+  { "ParameterKey": "LogRetentionDays", "ParameterValue": "365" },
+  { "ParameterKey": "DbAppAuth", "ParameterValue": "proxy" }
 ]

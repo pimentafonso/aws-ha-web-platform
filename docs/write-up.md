@@ -62,7 +62,20 @@ I deployed prod again later the same day and repeated the test. RDS reported the
 
 Two runs, the same cause, and six minutes in one against eleven to fourteen in the other. The length is the problem: I cannot predict it, so I cannot plan around it.
 
-So the choice that kept passwords out of the service cost minutes of downtime in exactly the event Multi-AZ is for. I still think IAM authentication is the right default, but it has to be paired with something that rides out a failover: RDS Proxy, which holds the database connections and can take the IAM sign-ins, or backoff in the app while sign-ins fail. I have not measured either yet. That is the next thing I would do.
+So the choice that kept passwords out of the service cost minutes of downtime in exactly the event Multi-AZ is for. I still think IAM authentication is the right default, but it has to be paired with something that rides out a failover: RDS Proxy, which holds the database connections and can take the IAM sign-ins, or backoff in the app while sign-ins fail. ### The fix
+
+I wrote the RDS Proxy version first. The AWS Free plan refused to create the proxy: *"This feature isn't available with free plan accounts."* So I added the option the account does allow: the service signs in with a generated password that ECS injects from Secrets Manager, and the database never sees an IAM token.
+
+On 18 November I deployed dev with a Multi-AZ `db.t4g.micro`, the same database as prod, and forced two failovers under the same k6 load:
+
+| Sign-in | Runs | RDS failover | App errors |
+|---|---|---|---|
+| IAM (prod, 17 November) | 2 | 29 s, 48 s | about 6 min, 11-14 min |
+| Password (dev, 18 November) | 2 | 35 s, 45 s | **23 s, 22 s** |
+
+What is left is the database's address moving: for about 20 seconds the app still tried the old primary and got `ECONNREFUSED`. That is the cost of DNS-based failover, and RDS Proxy is meant to hide it too.
+
+The trade-off is real. The service now holds a password, not rotated automatically yet, where before it held nothing. I took the twenty seconds. The proxy, written and linted but not deployed, would keep IAM for the service and the password with the proxy, on an account that allows it.
 
 ## The WAF test I did not plan
 
@@ -80,6 +93,6 @@ One cost I did find: my first prod session left two KMS keys enabled after the F
 
 ## What I would do differently
 
-- **Test failover before trusting it.** The design reviews, the linters and the local tests all agreed the database tier was highly available. One forced failover showed a six-minute gap that none of them could.
+- **Test failover before trusting it.** The design reviews, the linters and the local tests all agreed the database tier was highly available. One forced failover showed a six-minute gap that none of them could, and two more showed what fixed it.
 - **Deploy early, even a skeleton.** Most of the bugs above were small fixes, and I would rather have found them while writing each template than all at the end.
 - **Check the account's limits first.** Two of the Free plan's refusals each cost an 11-minute create and rollback of the data stack.

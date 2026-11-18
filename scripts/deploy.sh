@@ -14,6 +14,9 @@
 #   DB_BACKUP_RETENTION_DAYS, DB_INSTANCE_CLASS  override the database's
 #                          backup retention and size (Free plan accounts are
 #                          refused more than 1 day and anything above micro)
+#   DB_MULTI_AZ=true|false override the database's Multi-AZ setting
+#   DB_APP_AUTH=iam|password|proxy  override how the service signs in to the
+#                          database (both stacks; the Free plan refuses proxy)
 #   DOMAIN_NAME           prod: the delegated subdomain, e.g. notes.example.com
 #   IMAGE_TAG              image to deploy; default: the current commit SHA
 #   USE_EXEC_ROLE=true     deploy through the cicd stack's CloudFormation
@@ -163,6 +166,7 @@ deploy_compute() {
     --query 'PrefixLists[0].PrefixListId' --output text)
   [[ $prefix_list == pl-* ]] || die "CloudFront origin-facing prefix list not found in $REGION"
   local -a common=("CloudFrontPrefixListId=$prefix_list" "PermissionsBoundaryArn=$BOUNDARY")
+  [[ -z ${DB_APP_AUTH:-} ]] || common+=("DbAppAuth=$DB_APP_AUTH")
 
   status=$(stack_status "$ENV-compute")
   if [[ $status == NONE ]]; then
@@ -208,6 +212,8 @@ deploy_environment() {
   local data_args=("PermissionsBoundaryArn=$BOUNDARY")
   [[ -z ${DB_BACKUP_RETENTION_DAYS:-} ]] || data_args+=("DbBackupRetentionDays=$DB_BACKUP_RETENTION_DAYS")
   [[ -z ${DB_INSTANCE_CLASS:-} ]] || data_args+=("DbInstanceClass=$DB_INSTANCE_CLASS")
+  [[ -z ${DB_MULTI_AZ:-} ]] || data_args+=("DbMultiAz=$DB_MULTI_AZ")
+  [[ -z ${DB_APP_AUTH:-} ]] || data_args+=("DbAppAuth=$DB_APP_AUTH")
   deploy_stack "$ENV-data" data "$REGION" CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND "${data_args[@]}"
   deploy_stack "$ENV-registry" registry "$REGION" -
   push_image

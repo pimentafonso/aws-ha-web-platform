@@ -10,5 +10,6 @@
   { "ParameterKey": "DbPerformanceInsights", "ParameterValue": "true" },
   { "ParameterKey": "CacheNodeType", "ParameterValue": "cache.t4g.micro" },
   { "ParameterKey": "CacheNodeCount", "ParameterValue": "2" },
-  { "ParameterKey": "CacheSnapshotRetentionDays", "ParameterValue": "1" }
+  { "ParameterKey": "CacheSnapshotRetentionDays", "ParameterValue": "1" },
+  { "ParameterKey": "DbAppAuth", "ParameterValue": "proxy" }
 ]

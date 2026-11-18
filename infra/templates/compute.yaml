@@ -141,6 +141,16 @@ Parameters:
     AllowedPattern: ^[a-z_][a-z0-9_]{0,62}$
     Description: Database user the service connects as with IAM authentication.
 
+  DbAppAuth:
+    Type: String
+    Default: iam
+    AllowedValues: [iam, password, proxy]
+    Description: >-
+      Must match the data stack's DbAppAuth. password or proxy = the migration
+      task sets the app user's password from the data stack's secret.
+      password = the service signs in with it (ECS injects it); iam or proxy =
+      the service signs in with IAM tokens, to the instance or to RDS Proxy.
+
   ContainerInsights:
     Type: String
     AllowedValues: [enabled, disabled]
@@ -177,6 +187,8 @@ Conditions:
   HasCertificate: !Not [!Equals [!Ref DnsStackName, ""]]
   ServiceOn: !Equals [!Ref ServiceEnabled, "true"]
   HasMigrationImageTag: !Not [!Equals [!Ref MigrationImageTag, ""]]
+  AppUserPassword: !Not [!Equals [!Ref DbAppAuth, iam]]
+  ServicePassword: !Equals [!Ref DbAppAuth, password]
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -433,8 +445,14 @@ Resources:
               - Sid: CacheToken
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !ImportValue
-                  Fn::Sub: ${DataStackName}-CacheAuthSecretArn
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: ${DataStackName}-CacheAuthSecretArn
+                  - !If
+                    - ServicePassword
+                    - !ImportValue
+                      Fn::Sub: ${DataStackName}-AppDbUserSecretArn
+                    - !Ref AWS::NoValue
               - Sid: DecryptSecretsOnly
                 Effect: Allow
                 Action: kms:Decrypt
@@ -479,11 +497,17 @@ Resources:
                 Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AppLogGroup}:log-stream:*" # GetAtt Arn already ends in :*
-              - Sid: DatabaseMasterSecret
+              - Sid: DatabaseSecrets
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !ImportValue
-                  Fn::Sub: ${DataStackName}-DbSecretArn
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: ${DataStackName}-DbSecretArn
+                  - !If
+                    - AppUserPassword
+                    - !ImportValue
+                      Fn::Sub: ${DataStackName}-AppDbUserSecretArn
+                    - !Ref AWS::NoValue
               - Sid: DecryptSecretsOnly
                 Effect: Allow
                 Action: kms:Decrypt
@@ -522,7 +546,7 @@ Resources:
                 Resource: !Sub
                   - arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DbResourceId}/${DbAppUser}
                   - DbResourceId: !ImportValue
-                      Fn::Sub: ${DataStackName}-DbResourceId
+                      Fn::Sub: ${DataStackName}-DbConnectResourceId
       Tags:
         - { Key: Environment, Value: !Ref EnvironmentName }
         - { Key: Project, Value: aws-ha-web-platform }
@@ -578,7 +602,7 @@ Resources:
             - { Name: AWS_REGION, Value: !Ref AWS::Region }
             - Name: DB_HOST
               Value: !ImportValue
-                Fn::Sub: ${DataStackName}-DbEndpoint
+                Fn::Sub: ${DataStackName}-DbConnectEndpoint
             - Name: DB_PORT
               Value: !ImportValue
                 Fn::Sub: ${DataStackName}-DbPort
@@ -586,7 +610,7 @@ Resources:
               Value: !ImportValue
                 Fn::Sub: ${DataStackName}-DbName
             - { Name: DB_USER, Value: !Ref DbAppUser }
-            - { Name: DB_AUTH, Value: iam }
+            - { Name: DB_AUTH, Value: !If [ServicePassword, password, iam] }
             - { Name: DB_SSL_CA_PATH, Value: /etc/ssl/rds/eu-west-1-bundle.pem }
             - { Name: MIGRATE_ON_START, Value: "false" }
             - Name: REDIS_URL
@@ -600,6 +624,14 @@ Resources:
             - Name: REDIS_PASSWORD
               ValueFrom: !ImportValue
                 Fn::Sub: ${DataStackName}-CacheAuthSecretArn
+            - !If
+              - ServicePassword
+              - Name: DB_PASSWORD
+                ValueFrom: !Sub
+                  - "${SecretArn}:password::"
+                  - SecretArn: !ImportValue
+                      Fn::Sub: ${DataStackName}-AppDbUserSecretArn
+              - !Ref AWS::NoValue
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -660,6 +692,14 @@ Resources:
                 - "${SecretArn}:password::"
                 - SecretArn: !ImportValue
                     Fn::Sub: ${DataStackName}-DbSecretArn
+            - !If
+              - AppUserPassword
+              - Name: DB_APP_PASSWORD
+                ValueFrom: !Sub
+                  - "${SecretArn}:password::"
+                  - SecretArn: !ImportValue
+                      Fn::Sub: ${DataStackName}-AppDbUserSecretArn
+              - !Ref AWS::NoValue
           LogConfiguration:
             LogDriver: awslogs
             Options:

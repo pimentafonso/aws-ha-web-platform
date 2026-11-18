@@ -26,6 +26,8 @@ Metadata:
           - DbPerformanceInsights
           - DbName
           - DbMasterUsername
+          - DbProxy
+          - DbAppUser
       - Label: { default: Valkey }
         Parameters: [CacheNodeType, CacheNodeCount, CacheSnapshotRetentionDays]
       - Label: { default: Deploy }
@@ -104,6 +106,23 @@ Parameters:
     Description: >-
       Master user name. The password is generated and rotated by RDS in
       Secrets Manager and never appears in this template.
+  DbProxy:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      true = put RDS Proxy in front of the database. The service then signs in
+      to the proxy with IAM, and the proxy signs in to PostgreSQL with a
+      password it reads from Secrets Manager, so a Multi-AZ failover no longer
+      waits for IAM authentication on the new primary. Billed per vCPU of the
+      instance ($0.016 per vCPU-hour in eu-west-1, November 2026).
+  DbAppUser:
+    Type: String
+    Default: notes_app
+    AllowedPattern: ^[a-z_][a-z0-9_]{0,62}$
+    Description: >-
+      The service's database user. With the proxy, its password is generated
+      in Secrets Manager and set by the migration task; nothing else reads it.
 
   CacheNodeType:
     Type: String
@@ -145,6 +164,7 @@ Conditions:
   MultiAz: !Equals [!Ref DbMultiAz, "true"]
   PerformanceInsights: !Equals [!Ref DbPerformanceInsights, "true"]
   CacheReplica: !Equals [!Ref CacheNodeCount, 2]
+  UseProxy: !Equals [!Ref DbProxy, "true"]
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -398,6 +418,139 @@ Resources:
   # ElastiCache for Valkey. Cluster mode disabled: one shard, with an optional
   # replica in the other AZ that ElastiCache promotes if the primary fails.
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # RDS Proxy (optional, DbProxy=true). Clients sign in to the proxy with IAM
+  # (IAMAuth REQUIRED, TLS required), and the proxy signs in to PostgreSQL as
+  # the app user with a password from Secrets Manager. In two forced Multi-AZ
+  # failovers without it, IAM sign-in on the new primary failed for 6 and
+  # 11-14 minutes (docs/measurements.md); the proxy keeps that check off the
+  # database. The service still holds no password: only the proxy's role and
+  # the migration task can read this secret.
+  # ---------------------------------------------------------------------------
+  AppDbUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: UseProxy
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV2_AWS_57
+            comment: >-
+              Not rotated automatically yet: the proxy and the migration task
+              read it, nothing else. Rotation is listed under the README's next
+              steps, with the Valkey token's.
+    Properties:
+      Name: !Sub aws-ha-web-platform/${EnvironmentName}/db-app-user
+      Description: !Sub ${EnvironmentName} PostgreSQL password for ${DbAppUser}, used only by RDS Proxy
+      KmsKeyId: !Ref DataKey
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DbAppUser}"}'
+        GenerateStringKey: password
+        PasswordLength: 40
+        ExcludePunctuation: true # SCRAM-safe, and safe inside a SQL literal
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  DbProxyRole:
+    Type: AWS::IAM::Role
+    Condition: UseProxy
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-db-proxy
+      Description: Lets RDS Proxy read the app user's database password, and nothing else
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: rds.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: read-app-user-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppDbUserSecret
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt DataKey.Arn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub secretsmanager.${AWS::Region}.amazonaws.com
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  DbProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UseProxy
+    Properties:
+      GroupDescription: RDS Proxy, reachable only from the app tasks
+      VpcId: !ImportValue
+        Fn::Sub: ${NetworkStackName}-VpcId
+      SecurityGroupIngress:
+        - Description: PostgreSQL from the app tasks
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      SecurityGroupEgress:
+        - Description: PostgreSQL to the database
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-postgres-proxy" }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  DatabaseIngressFromProxy:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: UseProxy
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      Description: PostgreSQL from RDS Proxy
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref DbProxySecurityGroup
+
+  PostgresProxy:
+    Type: AWS::RDS::DBProxy
+    Condition: UseProxy
+    Properties:
+      DBProxyName: !Sub ${EnvironmentName}-postgres
+      EngineFamily: POSTGRESQL
+      RequireTLS: true
+      IdleClientTimeout: 1800
+      RoleArn: !GetAtt DbProxyRole.Arn
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref AppDbUserSecret
+          IAMAuth: REQUIRED
+          ClientPasswordAuthType: POSTGRES_SCRAM_SHA_256
+      VpcSubnetIds: !Split
+        - ","
+        - !ImportValue
+          Fn::Sub: ${NetworkStackName}-PrivateDataSubnetIds
+      VpcSecurityGroupIds: [!Ref DbProxySecurityGroup]
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Project, Value: aws-ha-web-platform }
+
+  DbProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Condition: UseProxy
+    Properties:
+      DBProxyName: !Ref PostgresProxy
+      TargetGroupName: default
+      DBInstanceIdentifiers: [!Ref Database]
+
   CacheSubnetGroup:
     Type: AWS::ElastiCache::SubnetGroup
     Properties:
@@ -467,6 +620,25 @@ Outputs:
     Description: PostgreSQL writer endpoint (DB_HOST). Follows the primary after a Multi-AZ failover.
     Value: !GetAtt Database.Endpoint.Address
     Export: { Name: !Sub "${AWS::StackName}-DbEndpoint" }
+  DbConnectEndpoint:
+    Description: >-
+      Where the service connects: the proxy endpoint with DbProxy=true, else
+      the instance endpoint.
+    Value: !If [UseProxy, !GetAtt PostgresProxy.Endpoint, !GetAtt Database.Endpoint.Address]
+    Export: { Name: !Sub "${AWS::StackName}-DbConnectEndpoint" }
+  DbConnectResourceId:
+    Description: >-
+      Resource id for the service's rds-db:connect policy: the proxy's prx-...
+      id with DbProxy=true, else the instance's DbiResourceId.
+    Value: !If
+      - UseProxy
+      - !Select [6, !Split [":", !GetAtt PostgresProxy.DBProxyArn]]
+      - !GetAtt Database.DbiResourceId
+    Export: { Name: !Sub "${AWS::StackName}-DbConnectResourceId" }
+  AppDbUserSecretArn:
+    Description: The app user's password secret (DbProxy=true), else "none".
+    Value: !If [UseProxy, !Ref AppDbUserSecret, none]
+    Export: { Name: !Sub "${AWS::StackName}-AppDbUserSecretArn" }
   DbPort:
     Value: !GetAtt Database.Endpoint.Port
     Export: { Name: !Sub "${AWS::StackName}-DbPort" }
